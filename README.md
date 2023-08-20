@@ -5,6 +5,7 @@ A collection of crates wrapping [pants](https://github.com/pantsbuild/pants) Rus
 
 # TODO
 - [ ] Migrate [upc](https://github.com/cosmicexplorer/upc)'s Rust FFI to call into crates from this workspace.
+- [ ] Integrate [`tracing`](https://github.com/tokio-rs/tracing) with `workunit_store` (?).
 
 # License
 [Apache v2](./LICENSE).
