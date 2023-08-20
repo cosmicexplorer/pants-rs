@@ -48,31 +48,35 @@
 
 /* use store::Store; */
 use task_executor::Executor;
-/* use workunit_store::WorkunitStore; */
+use workunit_store::WorkunitStore;
 
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 
 static PANTS_TOKIO_EXECUTOR: Lazy<Executor> = Lazy::new(Executor::new);
-/* static PANTS_WORKUNIT_STORE: Lazy<WorkunitStore> = Lazy::new(|| WorkunitStore::new(true)); */
+static PANTS_WORKUNIT_STORE: OnceCell<WorkunitStore> = OnceCell::new();
 
-pub fn init() {
+pub fn init(workunit_store: WorkunitStore) {
   let _ = *PANTS_TOKIO_EXECUTOR;
-  /* *PANTS_WORKUNIT_STORE; */
+  if !PANTS_WORKUNIT_STORE.set(workunit_store).is_ok() {
+    unreachable!("should not already have been initialized");
+  }
 }
 
 pub fn check() -> bool {
-  Lazy::get(&PANTS_TOKIO_EXECUTOR).is_some()
-  /* && Lazy::get(&PANTS_WORKUNIT_STORE).is_some() */
+  Lazy::get(&PANTS_TOKIO_EXECUTOR).is_some() && PANTS_WORKUNIT_STORE.get().is_some()
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
 
+  use workunit_store::Level;
+
   #[tokio::test]
   async fn it_works() {
     assert!(!check());
-    init();
+    let workunit_store = WorkunitStore::new(true, Level::Debug);
+    init(workunit_store);
     assert!(check());
   }
 }

@@ -14,7 +14,7 @@ repository.workspace    = true
 # store.workspace         = true
 task_executor.workspace = true
 workunit_store.workspace = true
-once_cell               = "1"
+once_cell.workspace     = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros"] }
+tokio                   = { workspace = true, features = ["macros"] }
