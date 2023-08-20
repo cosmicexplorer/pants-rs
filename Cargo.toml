@@ -1,0 +1,19 @@
+[workspace]
+members                 = []
+default-members         = []
+resolver                = "2"
+
+[workspace.dependencies.pants]
+git                     = "https://github.com/pantsbuild/pants"
+rev                     = "210ee99c856ae3c5b42ad761e31b26e26aeb9242"
+
+[workspace.package]
+version                 = "0.0.0"
+authors                 = ["Danny McClanahan <dmcC2@hypnicjerk.ai>"]
+edition                 = "2021"
+license                 = "Apache-2.0"
+
+keywords                = []
+categories              = []
+homepage                = "https://github.com/cosmicexplorer/pants-rs"
+repository              = "https://github.com/cosmicexplorer/pants-rs"
