@@ -14,7 +14,6 @@ repository.workspace    = true
 store.workspace         = true
 task_executor.workspace = true
 workunit_store.workspace = true
-once_cell.workspace     = true
 
 [dev-dependencies]
 tempfile.workspace      = true

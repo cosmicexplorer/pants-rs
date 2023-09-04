@@ -48,32 +48,31 @@
 
 use store::Store;
 use task_executor::Executor;
-use workunit_store::WorkunitStore;
-
-use once_cell::sync::{Lazy, OnceCell};
+use workunit_store::{Level, WorkunitStore};
 
 use std::path::Path;
 
-static PANTS_TOKIO_EXECUTOR: Lazy<Executor> = Lazy::new(Executor::new);
-static PANTS_WORKUNIT_STORE: OnceCell<WorkunitStore> = OnceCell::new();
-static PANTS_STORE: OnceCell<Store> = OnceCell::new();
-
-pub fn create_local_store(path: impl AsRef<Path>) -> Result<Store, String> {
-  Store::local_only(PANTS_TOKIO_EXECUTOR.clone(), path)
+pub struct Handles {
+  executor: Executor,
+  fs_store: Store,
+  workunit_store: WorkunitStore,
 }
 
-pub fn init(workunit_store: WorkunitStore, store: Store) {
-  let _ = *PANTS_TOKIO_EXECUTOR;
-  if !PANTS_WORKUNIT_STORE.set(workunit_store).is_ok() {
-    unreachable!("workunit store should not already have been initialized");
+impl Handles {
+  pub fn new(
+    log_starting_workunits: bool,
+    max_level: Level,
+    local_store_path: impl AsRef<Path>,
+  ) -> Result<Self, String> {
+    let exe = Executor::new();
+    let workunit_store = WorkunitStore::new(log_starting_workunits, max_level);
+    let local_store = Store::local_only(exe.clone(), local_store_path)?;
+    Ok(Self {
+      executor: exe,
+      fs_store: local_store,
+      workunit_store,
+    })
   }
-  if !PANTS_STORE.set(store).is_ok() {
-    unreachable!("fs store should not already have been initialized");
-  }
-}
-
-pub fn check() -> bool {
-  Lazy::get(&PANTS_TOKIO_EXECUTOR).is_some() && PANTS_WORKUNIT_STORE.get().is_some()
 }
 
 #[cfg(test)]
@@ -81,15 +80,10 @@ mod tests {
   use super::*;
 
   use tempfile::tempdir;
-  use workunit_store::Level;
 
   #[tokio::test]
   async fn it_works() {
-    assert!(!check());
-    let workunit_store = WorkunitStore::new(true, Level::Debug);
     let local_store_path = tempdir().unwrap();
-    let local_store = create_local_store(local_store_path.path()).unwrap();
-    init(workunit_store, local_store);
-    assert!(check());
+    let _handles = Handles::new(true, Level::Debug, local_store_path.path()).unwrap();
   }
 }
