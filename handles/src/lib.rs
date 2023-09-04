@@ -58,6 +58,7 @@ use bytes::Bytes;
 use displaydoc::Display;
 use futures::future::try_join_all;
 use parking_lot::Mutex;
+use tempfile;
 use thiserror::Error;
 use tokio::task::JoinError;
 use tokio_stream::{self, StreamExt};
@@ -67,9 +68,10 @@ use std::{
   collections::HashMap,
   io::{self, Read, Write},
   marker::Unpin,
+  mem, ops,
   os::unix::fs::PermissionsExt,
   path::{Path, PathBuf},
-  pin::pin,
+  pin::{pin, Pin},
   sync::Arc,
 };
 
@@ -291,6 +293,58 @@ pub trait ByteStore: HasExecutor {
     digest: hashing::Digest,
     f: F,
   ) -> Result<T, HandleError>;
+
+  /// Enter an arbitrary readable stream in the local store by writing it to a temporary file.
+  ///
+  ///```
+  /// # use executor_resource_handles::HandleError;
+  /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{ByteStore, Handles};
+  /// use tempfile::tempdir;
+  /// use std::str::FromStr;
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let td = tempdir()?;
+  /// let file_path = td.path().join("asdf.txt");
+  ///
+  /// let digest = {
+  ///   std::fs::write(&file_path, b"wowowow\n")?;
+  ///   let f = std::fs::OpenOptions::new().read(true).open(&file_path)?;
+  ///   handles.store_byte_stream(true, f).await?
+  /// };
+  /// let fp =
+  ///   hashing::Fingerprint::from_str("9da8e466dd1600e44f79f691d111d7d95dd02c70f8d92328fca0653daba85ae8")?;
+  /// assert_eq!(digest, hashing::Digest { hash: fp, size_bytes: 8 });
+  /// # Ok(())
+  /// # })}
+  ///```
+  async fn store_byte_stream<R: io::Read + Send + 'static>(
+    &self,
+    initial_lease: bool,
+    src: R,
+  ) -> Result<hashing::Digest, HandleError> {
+    /* FIXME: implement this without an intermediate temporary file! */
+    let tmp_out = self
+      .executor()
+      .native_spawn_blocking(move || {
+        let mut src = src;
+        let mut tmp_out = tempfile::NamedTempFile::new()?;
+        io::copy(&mut src, &mut tmp_out)?;
+        mem::forget(src);
+        Ok::<_, io::Error>(tmp_out)
+      })
+      .await??;
+
+    let tmp_out_path = tmp_out.path().to_path_buf();
+
+    Ok(
+      self
+        .store_streaming_file(initial_lease, true, tmp_out_path)
+        .await?,
+    )
+  }
 }
 
 /// Compose byte contents with relative paths to form virtual directory trees.
@@ -506,34 +560,6 @@ impl Handles {
       fs_store: local_store,
     })
   }
-
-  /* pub async fn store_byte_stream<R: io::Read + Send + Unpin>( */
-  /*   &self, */
-  /*   initial_lease: bool, */
-  /*   src: R, */
-  /* ) -> Result<hashing::Digest, HandleError> { */
-  /*   /\* FIXME: implement this without an intermediate temporary file! *\/ */
-  /*   use tempfile::NamedTempFile; */
-
-  /*   let tmp_out = NamedTempFile::new()?; */
-  /*   let tmp_out_path = tmp_out.path().to_path_buf(); */
-
-  /*   self */
-  /*     .executor() */
-  /*     .native_spawn_blocking(move || { */
-  /*       let src = pin!(src); */
-  /*       let tmp_out = pin!(tmp_out); */
-  /*       io::copy(&mut *src.get_mut(), &mut *tmp_out.get_mut())?; */
-  /*       Ok::<(), io::Error>(()) */
-  /*     }) */
-  /*     .await??; */
-
-  /*   Ok( */
-  /*     self */
-  /*       .store_streaming_file(initial_lease, true, tmp_out_path) */
-  /*       .await?, */
-  /*   ) */
-  /* } */
 }
 
 impl HasExecutor for Handles {
