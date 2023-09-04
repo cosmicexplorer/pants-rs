@@ -220,6 +220,28 @@ pub trait ByteStore: HasExecutor {
   ) -> Result<(), HandleError>;
 
   /// Stream in the contents of `src` to the local store.
+  ///
+  ///```
+  /// # fn main() -> Result<(), executor_resource_handles::HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{ByteStore, Handles};
+  /// use tempfile::tempdir;
+  /// use std::str::FromStr;
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let td = tempdir()?;
+  /// let out_path = td.path().join("c.txt");
+  /// std::fs::write(&out_path, b"hello!!!\n")?;
+  ///
+  /// let resulting_digest = handles.store_streaming_file(true, true, out_path).await?;
+  ///
+  /// let fp = hashing::Fingerprint::from_str("d1d23437b40e63d96c9bdd7458e1a61a72b70910d4f053744303f5165d64cbfd")?;
+  /// let digest = hashing::Digest { hash: fp, size_bytes: 9 };
+  /// assert_eq!(resulting_digest, digest);
+  /// # Ok(())
+  /// # })}
+  ///```
   async fn store_streaming_file(
     &self,
     initial_lease: bool,
