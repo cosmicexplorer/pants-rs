@@ -293,8 +293,35 @@ pub trait ByteStore: HasExecutor {
   ) -> Result<T, HandleError>;
 }
 
+/// Compose byte contents with relative paths to form virtual directory trees.
 #[async_trait]
 pub trait DirectoryStore {
+  /// Assign the file contents from `digest` to the file at `name`.
+  ///
+  ///```
+  /// # use executor_resource_handles::HandleError;
+  /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{ByteStore, DirectoryStore, Handles};
+  /// use bytes::Bytes;
+  /// use tempfile::tempdir;
+  /// use std::path::PathBuf;
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let msg = Bytes::copy_from_slice(b"wow\n");
+  /// let digest = handles.store_small_bytes(msg.clone(), true).await?;
+  ///
+  /// let name = fs::RelativePath::new("asdf.txt")?;
+  /// let snapshot = handles.snapshot_of_one_file(name, digest, false).await?;
+  /// assert_eq!(snapshot.files(), vec![PathBuf::from("asdf.txt")]);
+  /// assert!(snapshot.directories().is_empty());
+  /// let dir_digest: fs::DirectoryDigest = snapshot.into();
+  /// assert_eq!(digest, dir_digest.digests()[0]);
+  /// assert_eq!(2, dir_digest.digests().len());
+  /// # Ok(())
+  /// # })}
+  ///```
   async fn snapshot_of_one_file(
     &self,
     name: fs::RelativePath,
@@ -302,17 +329,150 @@ pub trait DirectoryStore {
     is_executable: bool,
   ) -> Result<store::Snapshot, HandleError>;
 
+  /// Recursively store all components of `tree` in the local store.
+  ///
+  ///```
+  /// # use executor_resource_handles::HandleError;
+  /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{ByteStore, DirectoryStore, Handles};
+  /// use bytes::Bytes;
+  /// use tempfile::tempdir;
+  /// use std::{path::{Path, PathBuf}, str::FromStr};
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let msg = Bytes::copy_from_slice(b"wow\n");
+  /// let fp: hashing::Fingerprint =
+  ///   hashing::Fingerprint::from_str("f40cd21f276e47d533371afce1778447e858eb5c9c0c0ed61c65f5c5d57caf63")?;
+  /// let msg2 = Bytes::copy_from_slice(b"hey\n");
+  /// let fp2: hashing::Fingerprint =
+  ///   hashing::Fingerprint::from_str("4e955fea0268518cbaa500409dfbec88f0ecebad28d84ecbe250baed97dba889")?;
+  ///
+  /// handles.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
+  ///
+  /// let digest = hashing::Digest { hash: fp, size_bytes: 4 };
+  /// let digest2 = hashing::Digest { hash: fp2, size_bytes: 4 };
+  ///
+  /// let digest_trie = fs::DigestTrie::from_unique_paths(
+  ///   vec![
+  ///     fs::directory::TypedPath::File { path: Path::new("a/a.txt"), is_executable: false },
+  ///     fs::directory::TypedPath::File { path: Path::new("a/b.txt"), is_executable: false },
+  ///   ],
+  ///   &vec![
+  ///     (PathBuf::from("a/a.txt"), digest),
+  ///     (PathBuf::from("a/b.txt"), digest2),
+  ///   ].into_iter().collect(),
+  /// )?;
+  ///
+  /// let dir_digest = handles.record_digest_trie(digest_trie, true).await?;
+  /// assert_eq!(4, dir_digest.digests().len());
+  /// assert_eq!(digest, dir_digest.digests()[2]);
+  /// assert_eq!(digest2, dir_digest.digests()[1]);
+  ///
+  /// assert_eq!(dir_digest.as_digest(), hashing::Digest {
+  ///   hash: hashing::Fingerprint::from_str("581505c0f50749195a505572dcfff89cd6a4218e61e1bb24496568d1b0362eff")?,
+  ///   size_bytes: 76,
+  /// });
+  /// # Ok(())
+  /// # })}
+  ///```
   async fn record_digest_trie(
     &self,
     tree: fs::DigestTrie,
     initial_lease: bool,
   ) -> Result<fs::DirectoryDigest, HandleError>;
 
+  /// Expand the symbolic directory tree associated with `digest`.
+  ///
+  ///```
+  /// # use executor_resource_handles::HandleError;
+  /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{ByteStore, DirectoryStore, Handles};
+  /// use bytes::Bytes;
+  /// use tempfile::tempdir;
+  /// use std::{path::{Path, PathBuf}, str::FromStr};
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let msg = Bytes::copy_from_slice(b"wow\n");
+  /// let fp: hashing::Fingerprint =
+  ///   hashing::Fingerprint::from_str("f40cd21f276e47d533371afce1778447e858eb5c9c0c0ed61c65f5c5d57caf63")?;
+  /// let msg2 = Bytes::copy_from_slice(b"hey\n");
+  /// let fp2: hashing::Fingerprint =
+  ///   hashing::Fingerprint::from_str("4e955fea0268518cbaa500409dfbec88f0ecebad28d84ecbe250baed97dba889")?;
+  ///
+  /// handles.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
+  ///
+  /// let digest = hashing::Digest { hash: fp, size_bytes: 4 };
+  /// let digest2 = hashing::Digest { hash: fp2, size_bytes: 4 };
+  ///
+  /// let digest_trie = fs::DigestTrie::from_unique_paths(
+  ///   vec![
+  ///     fs::directory::TypedPath::File { path: Path::new("a/a.txt"), is_executable: false },
+  ///     fs::directory::TypedPath::File { path: Path::new("a/b.txt"), is_executable: false },
+  ///   ],
+  ///   &vec![
+  ///     (PathBuf::from("a/a.txt"), digest),
+  ///     (PathBuf::from("a/b.txt"), digest2),
+  ///   ].into_iter().collect(),
+  /// )?;
+  ///
+  /// let dir_digest = handles.record_digest_trie(digest_trie.clone(), true).await?;
+  /// assert_eq!(
+  ///   digest_trie.as_remexec_directory(),
+  ///   handles.load_digest_trie(dir_digest).await?.as_remexec_directory(),
+  /// );
+  /// # Ok(())
+  /// # })}
+  ///```
   async fn load_digest_trie(
     &self,
     digest: fs::DirectoryDigest,
   ) -> Result<fs::DigestTrie, HandleError>;
 
+  /// Extract a directory structure from the given `digest`.
+  ///
+  ///```
+  /// # use executor_resource_handles::HandleError;
+  /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{ByteStore, DirectoryStore, Handles};
+  /// use bytes::Bytes;
+  /// use tempfile::tempdir;
+  /// use std::{path::{Path, PathBuf}, str::FromStr};
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let msg = Bytes::copy_from_slice(b"wow\n");
+  /// let fp: hashing::Fingerprint =
+  ///   hashing::Fingerprint::from_str("f40cd21f276e47d533371afce1778447e858eb5c9c0c0ed61c65f5c5d57caf63")?;
+  /// let msg2 = Bytes::copy_from_slice(b"hey\n");
+  /// let fp2: hashing::Fingerprint =
+  ///   hashing::Fingerprint::from_str("4e955fea0268518cbaa500409dfbec88f0ecebad28d84ecbe250baed97dba889")?;
+  ///
+  /// handles.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
+  ///
+  /// let digest = hashing::Digest { hash: fp, size_bytes: 4 };
+  /// let digest2 = hashing::Digest { hash: fp2, size_bytes: 4 };
+  ///
+  /// let digest_trie = fs::DigestTrie::from_unique_paths(
+  ///   vec![
+  ///     fs::directory::TypedPath::File { path: Path::new("a/a.txt"), is_executable: false },
+  ///     fs::directory::TypedPath::File { path: Path::new("a/b.txt"), is_executable: false },
+  ///   ],
+  ///   &vec![
+  ///     (PathBuf::from("a/a.txt"), digest),
+  ///     (PathBuf::from("a/b.txt"), digest2),
+  ///   ].into_iter().collect(),
+  /// )?;
+  ///
+  /// let dir_digest = handles.record_digest_trie(digest_trie.clone(), true).await?;
+  /// assert_eq!(dir_digest, handles.load_directory_digest(dir_digest.as_digest()).await?);
+  /// # Ok(())
+  /// # })}
+  ///```
   async fn load_directory_digest(
     &self,
     digest: hashing::Digest,
