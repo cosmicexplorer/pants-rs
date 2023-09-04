@@ -250,6 +250,36 @@ pub trait ByteStore: HasExecutor {
   ) -> Result<hashing::Digest, HandleError>;
 
   /// Remove the entry for `digest` from the local store.
+  ///
+  ///```
+  /// # use executor_resource_handles::HandleError;
+  /// # fn main() -> Result<(), executor_resource_handles::HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{ByteStore, Handles};
+  /// use bytes::Bytes;
+  /// use tempfile::tempdir;
+  /// use std::str::FromStr;
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let msg = Bytes::copy_from_slice(b"wow\n");
+  /// let digest = handles.store_small_bytes(msg.clone(), true).await?;
+  ///
+  /// let fp: hashing::Fingerprint =
+  ///   hashing::Fingerprint::from_str("f40cd21f276e47d533371afce1778447e858eb5c9c0c0ed61c65f5c5d57caf63")?;
+  /// assert_eq!(digest, hashing::Digest { hash: fp, size_bytes: 4 });
+  ///
+  /// assert_eq!(msg, handles.load_file_bytes_with(digest, Bytes::copy_from_slice).await?);
+  ///
+  /// assert!(handles.remove_entry(digest).await?);
+  ///
+  /// match handles.load_file_bytes_with(digest, Bytes::copy_from_slice).await {
+  ///   Err(HandleError::Store(store::StoreError::MissingDigest(_, _))) => (),
+  ///   _ => unreachable!(),
+  /// }
+  /// # Ok(())
+  /// # })}
+  ///```
   async fn remove_entry(&self, digest: hashing::Digest) -> Result<bool, HandleError>;
 
   /// Extract the byte string corresponding to `digest` from the local store.
