@@ -522,6 +522,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "displaydoc"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "487585f4d0c6655fe74905e2504d8ad6908e4db67f744eb140876906c2f3175d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.29",
+]
+
+[[package]]
 name = "either"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -552,11 +563,17 @@ dependencies = [
 name = "executor-resource-handles"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "bytes",
+ "displaydoc",
+ "fs",
+ "hashing",
+ "parking_lot",
  "store",
  "task_executor",
  "tempfile",
+ "thiserror",
  "tokio",
- "workunit_store",
 ]
 
 [[package]]

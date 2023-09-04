@@ -11,10 +11,17 @@ homepage.workspace      = true
 repository.workspace    = true
 
 [dependencies]
+async-trait.workspace   = true
+bytes.workspace         = true
+displaydoc.workspace    = true
+fs.workspace            = true
+hashing.workspace       = true
+parking_lot.workspace   = true
 store.workspace         = true
 task_executor.workspace = true
-workunit_store.workspace = true
+tempfile.workspace      = true
+thiserror.workspace     = true
+tokio.workspace         = true
 
 [dev-dependencies]
-tempfile.workspace      = true
 tokio                   = { workspace = true, features = ["macros"] }
