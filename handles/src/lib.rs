@@ -56,13 +56,18 @@ pub use task_executor::Executor;
 use async_trait::async_trait;
 use bytes::Bytes;
 use displaydoc::Display;
-/* use parking_lot::{Mutex, RwLock}; */
+use futures::future::try_join_all;
+use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::task::JoinError;
+use tokio_stream::{self, StreamExt};
+use zip_merge::{self as zip, result::ZipError, DateTime};
 
 use std::{
-  io,
+  collections::HashMap,
+  io::{self, Read, Write},
   marker::Unpin,
+  os::unix::fs::PermissionsExt,
   path::{Path, PathBuf},
   pin::pin,
   sync::Arc,
@@ -78,6 +83,8 @@ pub enum HandleError {
   Io(#[from] io::Error),
   /// join error: {0}
   Join(#[from] JoinError),
+  /// zip reror: {0}
+  Zip(#[from] ZipError),
 }
 
 impl From<String> for HandleError {
@@ -106,6 +113,34 @@ pub trait HasExecutor {
 
 #[async_trait]
 pub trait Crawler {
+  ///```
+  /// # fn main() -> Result<(), executor_resource_handles::HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{Crawler, Handles};
+  /// use tempfile::tempdir;
+  /// use std::{path::PathBuf, str::FromStr};
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let td = tempdir()?;
+  /// std::fs::write(td.path().join("a.txt"), "wow\n")?;
+  /// std::fs::write(td.path().join("b.txt"), "hey\n")?;
+  ///
+  /// let globs = fs::PreparedPathGlobs::create(
+  ///   vec!["*.txt".to_string()],
+  ///   fs::StrictGlobMatching::Ignore,
+  ///   fs::GlobExpansionConjunction::AnyMatch,
+  /// )?;
+  /// let snapshot = handles.expand_globs(td.path(), globs).await?;
+  /// assert_eq!(snapshot.files(), vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
+  /// let dir_digest: fs::DirectoryDigest = snapshot.into();
+  /// let digest = dir_digest.as_digest();
+  /// let fp: hashing::Fingerprint =
+  ///   hashing::Fingerprint::from_str("ba3e9666bbee9d4890698773b29532302024f40d0ce4764cfe4c4e91f5517be6")?;
+  /// assert_eq!(digest, hashing::Digest { hash: fp, size_bytes: 158 });
+  /// # Ok(())
+  /// # })}
+  ///```
   async fn expand_globs(
     &self,
     root: &Path,
@@ -133,34 +168,6 @@ pub trait ByteStore: HasExecutor {
     data_is_immutable: bool,
     src: PathBuf,
   ) -> Result<hashing::Digest, HandleError>;
-
-  async fn store_byte_stream<R: io::Read + Send + Unpin + 'static>(
-    &self,
-    initial_lease: bool,
-    src: R,
-  ) -> Result<hashing::Digest, HandleError> {
-    /* FIXME: implement this without an intermediate temporary file! */
-    use tempfile::NamedTempFile;
-
-    let tmp_out = NamedTempFile::new()?;
-    let tmp_out_path = tmp_out.path().to_path_buf();
-
-    self
-      .executor()
-      .native_spawn_blocking(move || {
-        let src = pin!(src);
-        let tmp_out = pin!(tmp_out);
-        io::copy(&mut *src.get_mut(), &mut *tmp_out.get_mut())?;
-        Ok::<(), io::Error>(())
-      })
-      .await??;
-
-    Ok(
-      self
-        .store_streaming_file(initial_lease, true, tmp_out_path)
-        .await?,
-    )
-  }
 
   async fn remove_entry(&self, digest: hashing::Digest) -> Result<bool, HandleError>;
 
@@ -200,6 +207,19 @@ pub trait DirectoryStore {
   ) -> Result<fs::DirectoryDigest, HandleError>;
 }
 
+/* #[async_trait] */
+/* pub trait ZipFileStore: ByteStore + DirectoryStore { */
+/*   async fn store_zip_entries<R: io::Read + io::Seek>( */
+/*     &self, */
+/*     archive: zip::ZipArchive<R>, */
+/*   ) -> Result<fs::DirectoryDigest, HandleError>; */
+/*   async fn synthesize_zip_file<W: io::Write + io::Seek + Send>( */
+/*     &self, */
+/*     digest: fs::DirectoryDigest, */
+/*     archive: zip::ZipWriter<W>, */
+/*   ) -> Result<zip::ZipWriter<W>, HandleError>; */
+/* } */
+
 pub struct Handles {
   executor: Executor,
   fs_store: store::Store,
@@ -214,6 +234,34 @@ impl Handles {
       fs_store: local_store,
     })
   }
+
+  /* pub async fn store_byte_stream<R: io::Read + Send + Unpin>( */
+  /*   &self, */
+  /*   initial_lease: bool, */
+  /*   src: R, */
+  /* ) -> Result<hashing::Digest, HandleError> { */
+  /*   /\* FIXME: implement this without an intermediate temporary file! *\/ */
+  /*   use tempfile::NamedTempFile; */
+
+  /*   let tmp_out = NamedTempFile::new()?; */
+  /*   let tmp_out_path = tmp_out.path().to_path_buf(); */
+
+  /*   self */
+  /*     .executor() */
+  /*     .native_spawn_blocking(move || { */
+  /*       let src = pin!(src); */
+  /*       let tmp_out = pin!(tmp_out); */
+  /*       io::copy(&mut *src.get_mut(), &mut *tmp_out.get_mut())?; */
+  /*       Ok::<(), io::Error>(()) */
+  /*     }) */
+  /*     .await??; */
+
+  /*   Ok( */
+  /*     self */
+  /*       .store_streaming_file(initial_lease, true, tmp_out_path) */
+  /*       .await?, */
+  /*   ) */
+  /* } */
 }
 
 impl HasExecutor for Handles {
@@ -233,7 +281,7 @@ impl Crawler for Handles {
 
     let vfs = Arc::new(self.create_vfs(root)?);
     let path_stats = vfs
-      .expand_globs(path_globs, fs::SymlinkBehavior::Oblivious, None)
+      .expand_globs(path_globs, fs::SymlinkBehavior::Aware, None)
       .await
       .map_err(|err| format!("Error expanding globs: {err}"))?;
     Ok(
@@ -347,6 +395,84 @@ impl DirectoryStore for Handles {
     Ok(self.fs_store.load_directory_digest(digest).await?)
   }
 }
+
+/* #[async_trait] */
+/* impl ZipFileStore for Handles { */
+/*   async fn store_zip_entries<R: io::Read + io::Seek>( */
+/*     &self, */
+/*     mut archive: zip::ZipArchive<R>, */
+/*   ) -> Result<fs::DirectoryDigest, HandleError> { */
+/*     let zip_files = (0..archive.len()) */
+/*       .map(|i| archive.by_index(i)) */
+/*       .collect::<Result<Vec<zip::read::ZipFile<'_>>, ZipError>>()?; */
+
+/*     let digest_name_map: Vec<(fs::directory::TypedPath, hashing::Digest)> = */
+/*       try_join_all(zip_files.into_iter().map(|zf| async move { */
+/*         let path = Path::new(zf.name()); */
+/*         let typed_path = if zf.is_dir() { */
+/*           fs::directory::TypedPath::Dir(path) */
+/*         } else { */
+/*           let is_executable = zf.unix_mode().map(|m| (m & 0o111) != 0).unwrap_or(false); */
+/*           fs::directory::TypedPath::File { */
+/*             path, */
+/*             is_executable, */
+/*           } */
+/*         }; */
+
+/*         let digest = self.store_byte_stream(true, zf.clone()).await?; */
+
+/*         Ok::<_, HandleError>((typed_path, digest)) */
+/*       })) */
+/*       .await?; */
+
+/*     let mut path_stats: Vec<fs::directory::TypedPath> = Vec::new(); */
+/*     let mut file_digests: HashMap<PathBuf, hashing::Digest> = HashMap::new(); */
+/*     for (typed_path, digest) in digest_name_map.into_iter() { */
+/*       let _ = file_digests.insert((*typed_path).to_path_buf(), digest); */
+/*       path_stats.push(typed_path); */
+/*     } */
+/*     let digest_trie = fs::directory::DigestTrie::from_unique_paths(path_stats, &file_digests)?; */
+/*     self.record_digest_trie(digest_trie, true).await */
+/*   } */
+
+/*   async fn synthesize_zip_file<W: io::Write + io::Seek + Send>( */
+/*     &self, */
+/*     digest: fs::DirectoryDigest, */
+/*     mut archive: zip::ZipWriter<W>, */
+/*   ) -> Result<zip::ZipWriter<W>, HandleError> { */
+/*     let digest_trie = self.load_digest_trie(digest).await?; */
+
+/*     let mut entries: Vec<(PathBuf, fs::directory::Entry)> = Vec::new(); */
+/*     digest_trie.walk( */
+/*       fs::SymlinkBehavior::Oblivious, */
+/*       &mut |path: &Path, entry: &fs::directory::Entry| { */
+/*         entries.push((path.to_path_buf(), entry.clone())); */
+/*       }, */
+/*     ); */
+
+/*     let options = zip::write::FileOptions::default().last_modified_time(DateTime::zero()); */
+
+/*     let mut stream = tokio_stream::iter(entries); */
+/*     while let Some((path, entry)) = stream.next().await { */
+/*       let path = format!("{}", path.display()); */
+/*       match entry { */
+/*         fs::directory::Entry::Directory(_) => { */
+/*           archive.add_directory(path, options)?; */
+/*         }, */
+/*         fs::directory::Entry::File(f) => { */
+/*           archive.start_file(path, options)?; */
+/*           let bytes = self */
+/*             .load_file_bytes_with(f.digest(), Bytes::copy_from_slice) */
+/*             .await?; */
+/*           archive.write_all(&bytes)?; */
+/*         }, */
+/*         _ => unreachable!("we chose SymlinkBehavior::Oblivious!"), */
+/*       } */
+/*     } */
+
+/*     Ok(archive) */
+/*   } */
+/* } */
 
 #[cfg(test)]
 mod tests {
