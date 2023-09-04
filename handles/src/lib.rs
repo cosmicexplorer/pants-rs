@@ -111,8 +111,11 @@ pub trait HasExecutor {
   }
 }
 
+/// Efficiently traverse the local disk and enter file contents in the persistent byte store.
 #[async_trait]
 pub trait Crawler {
+  /// Crawl the filesystem and enter every matching entry into the local store.
+  ///
   ///```
   /// # fn main() -> Result<(), executor_resource_handles::HandleError> { tokio_test::block_on(async {
   /// use executor_resource_handles::{Crawler, Handles};
@@ -148,20 +151,75 @@ pub trait Crawler {
   ) -> Result<store::Snapshot, HandleError>;
 }
 
+/// Enter and retrieve byte streams to and from the local store.
 #[async_trait]
 pub trait ByteStore: HasExecutor {
+  /// Store a small byte chunk.
+  ///
+  /// *NB: Use [`Self::store_streaming_file`] to stream in larger files.*
+  ///
+  ///```
+  /// # fn main() -> Result<(), executor_resource_handles::HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{ByteStore, Handles};
+  /// use bytes::Bytes;
+  /// use tempfile::tempdir;
+  /// use std::str::FromStr;
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let msg = Bytes::copy_from_slice(b"wow\n");
+  /// let digest = handles.store_small_bytes(msg, true).await?;
+  ///
+  /// let fp: hashing::Fingerprint =
+  ///   hashing::Fingerprint::from_str("f40cd21f276e47d533371afce1778447e858eb5c9c0c0ed61c65f5c5d57caf63")?;
+  /// assert_eq!(digest, hashing::Digest { hash: fp, size_bytes: 4 });
+  ///
+  /// # Ok(())
+  /// # })}
+  ///```
   async fn store_small_bytes(
     &self,
     bytes: Bytes,
     initial_lease: bool,
   ) -> Result<hashing::Digest, HandleError>;
 
+  /// Store multiple small byte chunks.
+  ///
+  ///```
+  /// # fn main() -> Result<(), executor_resource_handles::HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{ByteStore, Handles};
+  /// use bytes::Bytes;
+  /// use tempfile::tempdir;
+  /// use std::str::FromStr;
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let msg = Bytes::copy_from_slice(b"wow\n");
+  /// let fp: hashing::Fingerprint =
+  ///   hashing::Fingerprint::from_str("f40cd21f276e47d533371afce1778447e858eb5c9c0c0ed61c65f5c5d57caf63")?;
+  /// let msg2 = Bytes::copy_from_slice(b"hey\n");
+  /// let fp2: hashing::Fingerprint =
+  ///   hashing::Fingerprint::from_str("4e955fea0268518cbaa500409dfbec88f0ecebad28d84ecbe250baed97dba889")?;
+  ///
+  /// handles.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
+  ///
+  /// let digest = hashing::Digest { hash: fp, size_bytes: 4 };
+  /// let digest2 = hashing::Digest { hash: fp2, size_bytes: 4 };
+  ///
+  /// assert_eq!(msg, handles.load_file_bytes_with(digest, Bytes::copy_from_slice).await?);
+  /// assert_eq!(msg2, handles.load_file_bytes_with(digest2, Bytes::copy_from_slice).await?);
+  /// # Ok(())
+  /// # })}
+  ///```
   async fn store_small_bytes_batch(
     &self,
     items: Vec<(hashing::Fingerprint, Bytes)>,
     initial_lease: bool,
   ) -> Result<(), HandleError>;
 
+  /// Stream in the contents of `src` to the local store.
   async fn store_streaming_file(
     &self,
     initial_lease: bool,
@@ -169,8 +227,10 @@ pub trait ByteStore: HasExecutor {
     src: PathBuf,
   ) -> Result<hashing::Digest, HandleError>;
 
+  /// Remove the entry for `digest` from the local store.
   async fn remove_entry(&self, digest: hashing::Digest) -> Result<bool, HandleError>;
 
+  /// Extract the byte string corresponding to `digest` from the local store.
   async fn load_file_bytes_with<
     T: Send + 'static,
     F: Fn(&[u8]) -> T + Clone + Send + Sync + 'static,
