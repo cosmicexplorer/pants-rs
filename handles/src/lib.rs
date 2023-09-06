@@ -13,8 +13,6 @@
  * or correctness of the code. */
 // #![warn(missing_docs)]
 
-/* Note: run clippy with: rustup run nightly cargo-clippy! */
-#![deny(unsafe_code)]
 /* Ensure any doctest warnings fails the doctest! */
 #![doc(test(attr(deny(warnings))))]
 /* Enable all clippy lints except for many of the pedantic ones. It's a shame this needs to be
@@ -60,7 +58,7 @@ use futures::future::try_join_all;
 use parking_lot::Mutex;
 use tempfile;
 use thiserror::Error;
-use tokio::task::JoinError;
+use tokio::{task, task::JoinError};
 use tokio_stream::{self, StreamExt};
 use zip_merge::{self as zip, result::ZipError, DateTime};
 
@@ -320,29 +318,45 @@ pub trait ByteStore: HasExecutor {
   /// # Ok(())
   /// # })}
   ///```
-  async fn store_byte_stream<R: io::Read + Send + 'static>(
+  async fn store_byte_stream<R: io::Read + Send>(
     &self,
     initial_lease: bool,
     src: R,
   ) -> Result<hashing::Digest, HandleError> {
     /* FIXME: implement this without an intermediate temporary file! */
-    let tmp_out = self
-      .executor()
-      .native_spawn_blocking(move || {
-        let mut src = src;
-        let mut tmp_out = tempfile::NamedTempFile::new()?;
-        io::copy(&mut src, &mut tmp_out)?;
-        mem::forget(src);
-        Ok::<_, io::Error>(tmp_out)
-      })
-      .await??;
-
+    let tmp_out = Reader::new(src).expand_into_named_file().await?;
     let tmp_out_path = tmp_out.path().to_path_buf();
-
     Ok(
       self
         .store_streaming_file(initial_lease, true, tmp_out_path)
         .await?,
+    )
+  }
+}
+
+struct Reader<R> {
+  inner: R,
+}
+
+impl<R> Reader<R> {
+  pub fn new(inner: R) -> Self {
+    Self { inner }
+  }
+}
+
+impl<R: io::Read + Send> Reader<R> {
+  pub async fn expand_into_named_file(self) -> Result<tempfile::NamedTempFile, HandleError> {
+    /* FIXME: terrible, terrible hack to work around weird inference of R requiring 'static
+     * lifetime, even though R is moved and therefore shouldn't need to care? */
+    let p = Box::into_raw(Box::new(self)) as usize;
+    Ok(
+      task::spawn_blocking(move || {
+        let mut s = unsafe { Box::from_raw(p as *mut Self) };
+        let mut tmp_out = tempfile::NamedTempFile::new()?;
+        io::copy(&mut s.inner, &mut tmp_out)?;
+        Ok::<_, io::Error>(tmp_out)
+      })
+      .await??,
     )
   }
 }
@@ -533,18 +547,20 @@ pub trait DirectoryStore {
   ) -> Result<fs::DirectoryDigest, HandleError>;
 }
 
-/* #[async_trait] */
-/* pub trait ZipFileStore: ByteStore + DirectoryStore { */
-/*   async fn store_zip_entries<R: io::Read + io::Seek>( */
-/*     &self, */
-/*     archive: zip::ZipArchive<R>, */
-/*   ) -> Result<fs::DirectoryDigest, HandleError>; */
-/*   async fn synthesize_zip_file<W: io::Write + io::Seek + Send>( */
-/*     &self, */
-/*     digest: fs::DirectoryDigest, */
-/*     archive: zip::ZipWriter<W>, */
-/*   ) -> Result<zip::ZipWriter<W>, HandleError>; */
-/* } */
+/* pub trait ReadWriteSeekStream {} */
+
+#[async_trait]
+pub trait ZipFileStore {
+  async fn store_zip_entries<R: io::Read + io::Seek + Send>(
+    &self,
+    archive: zip::ZipArchive<R>,
+  ) -> Result<fs::DirectoryDigest, HandleError>;
+  async fn synthesize_zip_file<W: io::Write + io::Seek + Send>(
+    &self,
+    digest: fs::DirectoryDigest,
+    archive: zip::ZipWriter<W>,
+  ) -> Result<zip::ZipWriter<W>, HandleError>;
+}
 
 pub struct Handles {
   executor: Executor,
@@ -696,17 +712,25 @@ impl DirectoryStore for Handles {
 
 /* #[async_trait] */
 /* impl ZipFileStore for Handles { */
-/*   async fn store_zip_entries<R: io::Read + io::Seek>( */
+/*   async fn store_zip_entries<R: io::Read + io::Seek + Send>( */
 /*     &self, */
-/*     mut archive: zip::ZipArchive<R>, */
+/*     archive: zip::ZipArchive<R>, */
 /*   ) -> Result<fs::DirectoryDigest, HandleError> { */
-/*     let zip_files = (0..archive.len()) */
-/*       .map(|i| archive.by_index(i)) */
-/*       .collect::<Result<Vec<zip::read::ZipFile<'_>>, ZipError>>()?; */
+/*     let num_items = archive.len(); */
+/*     let archive = Arc::new(Mutex::new(archive)); */
 
-/*     let digest_name_map: Vec<(fs::directory::TypedPath, hashing::Digest)> = */
-/*       try_join_all(zip_files.into_iter().map(|zf| async move { */
-/*         let path = Path::new(zf.name()); */
+/*     let path_digests: Vec<(fs::directory::TypedPath, hashing::Digest)> = */
+/*       try_join_all((0..num_items).map(|i| async { */
+/*         let archive = archive.clone(); */
+/*         let archive = archive.lock(); */
+/*         let zf = archive.by_index(i)?; */
+
+/*         let path = if let Some(name) = zf.enclosed_name() { */
+/*           name */
+/*         } else { */
+/*           /\* TODO: log if zip entry name is malformed? *\/ */
+/*           unreachable!(); */
+/*         }; */
 /*         let typed_path = if zf.is_dir() { */
 /*           fs::directory::TypedPath::Dir(path) */
 /*         } else { */
@@ -717,7 +741,7 @@ impl DirectoryStore for Handles {
 /*           } */
 /*         }; */
 
-/*         let digest = self.store_byte_stream(true, zf.clone()).await?; */
+/*         let digest = self.store_byte_stream(true, zf).await?; */
 
 /*         Ok::<_, HandleError>((typed_path, digest)) */
 /*       })) */
@@ -725,10 +749,11 @@ impl DirectoryStore for Handles {
 
 /*     let mut path_stats: Vec<fs::directory::TypedPath> = Vec::new(); */
 /*     let mut file_digests: HashMap<PathBuf, hashing::Digest> = HashMap::new(); */
-/*     for (typed_path, digest) in digest_name_map.into_iter() { */
+/*     for (typed_path, digest) in path_digests.into_iter() { */
 /*       let _ = file_digests.insert((*typed_path).to_path_buf(), digest); */
 /*       path_stats.push(typed_path); */
 /*     } */
+
 /*     let digest_trie = fs::directory::DigestTrie::from_unique_paths(path_stats, &file_digests)?; */
 /*     self.record_digest_trie(digest_trie, true).await */
 /*   } */
