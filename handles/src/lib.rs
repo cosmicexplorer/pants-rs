@@ -615,7 +615,23 @@ pub struct Handles {
 }
 
 impl Handles {
-  pub fn new(local_store_path: impl AsRef<Path>) -> Result<Self, String> {
+  /// Create a new executor and local store.
+  ///
+  /// NB: although it's synchronous, this method must be run from within an active tokio
+  /// execution context!
+  ///
+  ///```
+  /// # use executor_resource_handles::HandleError;
+  /// # fn main() -> Result<(), HandleError> {
+  /// use executor_resource_handles::Handles;
+  /// use tempfile::tempdir;
+  ///
+  /// let local_store_path = tempdir()?;
+  /// let _ = tokio_test::block_on(async { Handles::new(local_store_path.path()) })?;
+  /// # Ok(())
+  /// # }
+  ///```
+  pub fn new(local_store_path: impl AsRef<Path>) -> Result<Self, HandleError> {
     let exe = Executor::new();
     let local_store = store::Store::local_only(exe.clone(), local_store_path)?;
     Ok(Self {
@@ -847,16 +863,3 @@ impl DirectoryStore for Handles {
 /* struct ZipReader<R> { */
 
 /* } */
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  use tempfile::tempdir;
-
-  #[tokio::test]
-  async fn it_works() {
-    let local_store_path = tempdir().unwrap();
-    let _handles = Handles::new(local_store_path.path()).unwrap();
-  }
-}
