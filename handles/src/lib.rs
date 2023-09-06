@@ -324,8 +324,48 @@ pub trait ByteStore: HasExecutor {
     src: R,
   ) -> Result<hashing::Digest, HandleError> {
     /* FIXME: implement this without an intermediate temporary file! */
-    let tmp_out = Reader::new(src).expand_into_named_file().await?;
-    let tmp_out_path = tmp_out.path().to_path_buf();
+    let tmp_out = Reader::new(src).expand_reader().await?;
+    let tmp_out_path = tmp_out.to_path_buf();
+    Ok(
+      self
+        .store_streaming_file(initial_lease, true, tmp_out_path)
+        .await?,
+    )
+  }
+
+  /// Enter an arbitrary readable stream in the local store by writing it to a temporary file.
+  ///
+  ///```
+  /// # use executor_resource_handles::HandleError;
+  /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{ByteStore, Handles};
+  /// use tempfile::tempdir;
+  /// use std::str::FromStr;
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let td = tempdir()?;
+  /// let file_path = td.path().join("asdf.txt");
+  ///
+  /// let digest = {
+  ///   std::fs::write(&file_path, b"wowowow\n")?;
+  ///   let f = tokio::fs::OpenOptions::new().read(true).open(&file_path).await?;
+  ///   handles.store_async_byte_stream(true, f).await?
+  /// };
+  /// let fp =
+  ///   hashing::Fingerprint::from_str("9da8e466dd1600e44f79f691d111d7d95dd02c70f8d92328fca0653daba85ae8")?;
+  /// assert_eq!(digest, hashing::Digest { hash: fp, size_bytes: 8 });
+  /// # Ok(())
+  /// # })}
+  ///```
+  async fn store_async_byte_stream<R: tokio::io::AsyncRead + Send + Unpin>(
+    &self,
+    initial_lease: bool,
+    src: R,
+  ) -> Result<hashing::Digest, HandleError> {
+    let tmp_out = Reader::new(src).expand_async_reader().await?;
+    let tmp_out_path = tmp_out.to_path_buf();
     Ok(
       self
         .store_streaming_file(initial_lease, true, tmp_out_path)
@@ -345,19 +385,28 @@ impl<R> Reader<R> {
 }
 
 impl<R: io::Read + Send> Reader<R> {
-  pub async fn expand_into_named_file(self) -> Result<tempfile::NamedTempFile, HandleError> {
+  pub async fn expand_reader(self) -> Result<tempfile::TempPath, HandleError> {
     /* FIXME: terrible, terrible hack to work around weird inference of R requiring 'static
      * lifetime, even though R is moved and therefore shouldn't need to care? */
     let p = Box::into_raw(Box::new(self)) as usize;
     Ok(
       task::spawn_blocking(move || {
         let mut s = unsafe { Box::from_raw(p as *mut Self) };
-        let mut tmp_out = tempfile::NamedTempFile::new()?;
+        let (mut tmp_out, out_path) = tempfile::NamedTempFile::new()?.into_parts();
         io::copy(&mut s.inner, &mut tmp_out)?;
-        Ok::<_, io::Error>(tmp_out)
+        Ok::<_, io::Error>(out_path)
       })
       .await??,
     )
+  }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> Reader<R> {
+  pub async fn expand_async_reader(mut self) -> Result<tempfile::TempPath, HandleError> {
+    let (tmp_out, out_path) = tempfile::NamedTempFile::new()?.into_parts();
+    let mut tmp_out = tokio::fs::File::from_std(tmp_out);
+    tokio::io::copy(&mut self.inner, &mut tmp_out).await?;
+    Ok(out_path)
   }
 }
 
@@ -546,8 +595,6 @@ pub trait DirectoryStore {
     digest: hashing::Digest,
   ) -> Result<fs::DirectoryDigest, HandleError>;
 }
-
-/* pub trait ReadWriteSeekStream {} */
 
 #[async_trait]
 pub trait ZipFileStore {
@@ -795,6 +842,10 @@ impl DirectoryStore for Handles {
 
 /*     Ok(archive) */
 /*   } */
+/* } */
+
+/* struct ZipReader<R> { */
+
 /* } */
 
 #[cfg(test)]
