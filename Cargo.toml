@@ -15,7 +15,8 @@ task_executor           = { path = "pants/src/rust/engine/task_executor" }
 
 # Versions with my own fixes in.
 displaydoc              = "0.2.4"
-thiserror               = "1.0.30"
+thiserror               = "1.0.48"
+zip                     = { version = "0.6.6" }
 
 # From pants/src/rust/engine/Cargo.toml (.cargo/config also copied from the pants repo):
 arc-swap                = "1.5"

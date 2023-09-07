@@ -26,8 +26,7 @@ tempfile.workspace      = true
 thiserror.workspace     = true
 tokio.workspace         = true
 tokio-stream.workspace  = true
-# zip-merge               = { version = "0.6.6", features = ["merge", "rayon", "time"] }
-zip-merge               = { path = "/home/cosmicexplorer/tools/zip", features = ["merge", "rayon", "time"] }
+zip.workspace           = true
 
 [dev-dependencies]
 tokio                   = { workspace = true, features = ["macros"] }

@@ -64,8 +64,8 @@ use thiserror::Error;
 use tokio::{task, task::JoinError};
 pub use tokio_stream::Stream;
 use tokio_stream::StreamExt;
-pub use zip_merge as zip;
-use zip_merge::{result::ZipError, DateTime};
+pub use zip;
+use zip::{result::ZipError, DateTime};
 
 use std::{
   collections::HashMap,
@@ -677,7 +677,7 @@ pub trait ZipFileStore {
   /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
   /// use executor_resource_handles::{ZipFileStore, Handles};
   /// use tempfile::tempdir;
-  /// use zip_merge::{ZipArchive, ZipWriter, write::FileOptions};
+  /// use zip::{ZipArchive, ZipWriter, write::FileOptions};
   /// use std::{io::{Write, Cursor}, str::FromStr};
   ///
   /// let store_td = tempdir()?;
@@ -712,7 +712,7 @@ pub trait ZipFileStore {
   /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
   /// use executor_resource_handles::{ZipFileStore, Handles};
   /// use tempfile::tempdir;
-  /// use zip_merge::{ZipArchive, ZipWriter, write::FileOptions};
+  /// use zip::{ZipArchive, ZipWriter, write::FileOptions};
   /// use std::{io::{Write, Cursor}, str::FromStr};
   ///
   /// let store_td = tempdir()?;
@@ -990,7 +990,9 @@ impl ZipFileStore for Handles {
       },
     );
 
-    let options = zip::write::FileOptions::default().last_modified_time(DateTime::zero());
+    /* FIXME: explicitly use DateTime::zero() when https://github.com/zip-rs/zip/pull/399 is
+     * merged! */
+    let options = zip::write::FileOptions::default().last_modified_time(DateTime::default());
 
     for (path, entry) in entries.into_iter() {
       let path = format!("{}", path.display());
@@ -1117,7 +1119,9 @@ mod test {
 
     let buf = io::Cursor::new(Vec::new());
     let mut zip = zip::ZipWriter::new(buf);
-    let options = zip::write::FileOptions::default().last_modified_time(DateTime::zero());
+    /* FIXME: explicitly use DateTime::zero() when https://github.com/zip-rs/zip/pull/399 is
+     * merged! */
+    let options = zip::write::FileOptions::default().last_modified_time(DateTime::default());
     zip.start_file("a.txt", options)?;
     io::copy(
       &mut std::fs::OpenOptions::new()
