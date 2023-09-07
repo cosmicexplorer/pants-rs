@@ -1,5 +1,6 @@
 /*
- * Description: ???
+ * Description: A set of utilities to symbolically manipulate file contents and directory trees by
+ *              entering their contents into a content-addressed store.
  *
  * Copyright (C) 2023 Danny McClanahan <dmcC2@hypnicjerk.ai>
  * SPDX-License-Identifier: Apache-2.0
@@ -7,12 +8,14 @@
  * Licensed under the Apache License, Version 2.0 (see LICENSE).
  */
 
-//! ???
+//! A set of utilities to symbolically manipulate file contents and directory trees by entering
+//! their contents into a content-addressed store.
+//!
+//! **TODO: support for remote sync!**
 
 /* These clippy lint descriptions are purely non-functional and do not affect the functionality
  * or correctness of the code. */
-// #![warn(missing_docs)]
-
+#![warn(missing_docs)]
 /* Ensure any doctest warnings fails the doctest! */
 #![doc(test(attr(deny(warnings))))]
 /* Enable all clippy lints except for many of the pedantic ones. It's a shame this needs to be
@@ -53,14 +56,16 @@ pub use task_executor::Executor;
 
 use async_stream::try_stream;
 use async_trait::async_trait;
-use bytes::Bytes;
+pub use bytes::Bytes;
 use displaydoc::Display;
 use futures_util::pin_mut;
 use tempfile;
 use thiserror::Error;
 use tokio::{task, task::JoinError};
-use tokio_stream::{Stream, StreamExt};
-use zip_merge::{self as zip, result::ZipError, DateTime};
+pub use tokio_stream::Stream;
+use tokio_stream::StreamExt;
+pub use zip_merge as zip;
+use zip_merge::{result::ZipError, DateTime};
 
 use std::{
   collections::HashMap,
@@ -72,6 +77,7 @@ use std::{
   sync::Arc,
 };
 
+/// Top-level errors produced by this crate.
 #[derive(Debug, Display, Error)]
 pub enum HandleError {
   /// error string: {0}
@@ -100,24 +106,17 @@ impl From<store::StoreError> for HandleError {
   }
 }
 
+/// Errors when transforming file paths between contexts.
 #[derive(Debug, Display, Error)]
 pub enum PathTransformError {
   /// Zip entry name was invalid: {0}
   MalformedZipName(String),
 }
 
+/// Task executor resources with support for a main loop and trailing tasks.
 pub trait HasExecutor {
+  /// A handle to a pants task executor.
   fn executor(&self) -> &Executor;
-  fn create_vfs(&self, root: &Path) -> Result<fs::PosixFS, HandleError> {
-    Ok(fs::PosixFS::new_with_symlink_behavior(
-      root,
-      /* TODO: add this as an option when creating a Handles! */
-      fs::GitignoreStyleExcludes::empty(),
-      self.executor().clone(),
-      /* TODO: add this as an option when creating a Handles! */
-      fs::SymlinkBehavior::Oblivious,
-    )?)
-  }
 }
 
 /// Efficiently traverse the local disk and enter file contents in the persistent byte store.
@@ -162,7 +161,7 @@ pub trait Crawler {
 
 /// Enter and retrieve byte streams to and from the local store.
 #[async_trait]
-pub trait ByteStore: HasExecutor {
+pub trait ByteStore {
   /// Store a small byte chunk.
   ///
   /// *NB: Use [`Self::store_streaming_file`] to stream in larger files.*
@@ -784,6 +783,17 @@ impl Handles {
       executor: exe,
       fs_store: local_store,
     })
+  }
+
+  pub(crate) fn create_vfs(&self, root: &Path) -> Result<fs::PosixFS, HandleError> {
+    Ok(fs::PosixFS::new_with_symlink_behavior(
+      root,
+      /* TODO: add this as an option when creating a Handles! */
+      fs::GitignoreStyleExcludes::empty(),
+      self.executor().clone(),
+      /* TODO: add this as an option when creating a Handles! */
+      fs::SymlinkBehavior::Oblivious,
+    )?)
   }
 }
 
