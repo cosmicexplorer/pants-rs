@@ -67,6 +67,7 @@ use std::{
   io::{self, Write},
   marker::PhantomData,
   marker::Unpin,
+  ops,
   path::{Path, PathBuf},
   sync::Arc,
 };
@@ -406,9 +407,9 @@ impl<R: io::Read> Reader<R> {
      * lifetime, even though R is moved and therefore shouldn't need to care? */
     Ok(
       task::spawn_blocking(move || {
-        let mut inner: Box<R> = unsafe { Box::from_raw(self.inner as *mut R) };
+        let inner: Box<R> = unsafe { Box::from_raw(self.inner as *mut R) };
         let (mut tmp_out, out_path) = tempfile::NamedTempFile::new()?.into_parts();
-        io::copy(&mut *inner, &mut tmp_out)?;
+        io::copy(Box::leak(inner), &mut tmp_out)?;
         Ok::<_, io::Error>(out_path)
       })
       .await??,
@@ -418,11 +419,18 @@ impl<R: io::Read> Reader<R> {
 
 impl<R: tokio::io::AsyncRead + Unpin> Reader<R> {
   pub async fn expand_async_reader(self) -> Result<tempfile::TempPath, HandleError> {
-    let mut inner: Box<R> = unsafe { Box::from_raw(self.inner as *mut R) };
+    let inner: Box<R> = unsafe { Box::from_raw(self.inner as *mut R) };
     let (tmp_out, out_path) = tempfile::NamedTempFile::new()?.into_parts();
     let mut tmp_out = tokio::fs::File::from_std(tmp_out);
-    tokio::io::copy(&mut *inner, &mut tmp_out).await?;
+    tokio::io::copy(Box::leak(inner), &mut tmp_out).await?;
     Ok(out_path)
+  }
+}
+
+impl<R> ops::Drop for Reader<R> {
+  fn drop(&mut self) {
+    /* Drop the box. */
+    let _: Box<R> = unsafe { Box::from_raw(self.inner as *mut R) };
   }
 }
 
@@ -1044,6 +1052,14 @@ impl<'a, R: io::Read + io::Seek + 'a> ZipReader<R> {
   }
 }
 
+impl<R> ops::Drop for ZipReader<R> {
+  fn drop(&mut self) {
+    /* Drop the box. */
+    let _: Box<zip::ZipArchive<R>> =
+      unsafe { Box::from_raw(self.inner as *mut zip::ZipArchive<R>) };
+  }
+}
+
 impl<R: io::Read + io::Seek> ZipReader<R> {
   pub fn new(inner: zip::ZipArchive<R>) -> Self {
     let num_entries = inner.len();
@@ -1068,10 +1084,6 @@ impl<R: io::Read + io::Seek> ZipReader<R> {
         let ret = (stat, tmp_path);
         yield ret;
       }
-
-      /* Drop the box. */
-      let _: Box<zip::ZipArchive<R>> =
-        unsafe { Box::from_raw(self.inner as *mut zip::ZipArchive<R>) };
     }
   }
 }
