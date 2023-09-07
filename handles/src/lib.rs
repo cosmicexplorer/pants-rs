@@ -110,8 +110,10 @@ pub trait HasExecutor {
   fn create_vfs(&self, root: &Path) -> Result<fs::PosixFS, HandleError> {
     Ok(fs::PosixFS::new_with_symlink_behavior(
       root,
+      /* TODO: add this as an option when creating a Handles! */
       fs::GitignoreStyleExcludes::empty(),
       self.executor().clone(),
+      /* TODO: add this as an option when creating a Handles! */
       fs::SymlinkBehavior::Oblivious,
     )?)
   }
@@ -608,6 +610,54 @@ pub trait DirectoryStore {
     &self,
     digest: hashing::Digest,
   ) -> Result<fs::DirectoryDigest, HandleError>;
+
+  /// Generate a snapshot by enumerating file paths from `digest`.
+  ///
+  ///```
+  /// # use executor_resource_handles::HandleError;
+  /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{ByteStore, DirectoryStore, Handles};
+  /// use bytes::Bytes;
+  /// use tempfile::tempdir;
+  /// use std::{path::{Path, PathBuf}, str::FromStr};
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let msg = Bytes::copy_from_slice(b"wow\n");
+  /// let fp: hashing::Fingerprint =
+  ///   hashing::Fingerprint::from_str("f40cd21f276e47d533371afce1778447e858eb5c9c0c0ed61c65f5c5d57caf63")?;
+  /// let msg2 = Bytes::copy_from_slice(b"hey\n");
+  /// let fp2: hashing::Fingerprint =
+  ///   hashing::Fingerprint::from_str("4e955fea0268518cbaa500409dfbec88f0ecebad28d84ecbe250baed97dba889")?;
+  ///
+  /// handles.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
+  ///
+  /// let digest = hashing::Digest { hash: fp, size_bytes: 4 };
+  /// let digest2 = hashing::Digest { hash: fp2, size_bytes: 4 };
+  ///
+  /// let digest_trie = fs::DigestTrie::from_unique_paths(
+  ///   vec![
+  ///     fs::directory::TypedPath::File { path: Path::new("a/a.txt"), is_executable: false },
+  ///     fs::directory::TypedPath::File { path: Path::new("a/b.txt"), is_executable: false },
+  ///   ],
+  ///   &vec![
+  ///     (PathBuf::from("a/a.txt"), digest),
+  ///     (PathBuf::from("a/b.txt"), digest2),
+  ///   ].into_iter().collect(),
+  /// )?;
+  ///
+  /// let dir_digest = handles.record_digest_trie(digest_trie.clone(), true).await?;
+  /// let snapshot = handles.load_snapshot(dir_digest).await?;
+  /// assert_eq!(snapshot.files(), vec![PathBuf::from("a/a.txt"), PathBuf::from("a/b.txt")]);
+  /// assert_eq!(snapshot.directories(), vec![PathBuf::from("a")]);
+  /// # Ok(())
+  /// # })}
+  ///```
+  async fn load_snapshot(
+    &self,
+    digest: fs::DirectoryDigest,
+  ) -> Result<store::Snapshot, HandleError>;
 }
 
 /// Manipulate zip files as directory trees.
@@ -858,6 +908,13 @@ impl DirectoryStore for Handles {
     digest: hashing::Digest,
   ) -> Result<fs::DirectoryDigest, HandleError> {
     Ok(self.fs_store.load_directory_digest(digest).await?)
+  }
+
+  async fn load_snapshot(
+    &self,
+    digest: fs::DirectoryDigest,
+  ) -> Result<store::Snapshot, HandleError> {
+    Ok(store::Snapshot::from_digest(self.fs_store.clone(), digest).await?)
   }
 }
 
