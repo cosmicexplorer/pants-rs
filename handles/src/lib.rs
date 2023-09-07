@@ -1075,3 +1075,88 @@ impl<R: io::Read + io::Seek> ZipReader<R> {
     }
   }
 }
+
+#[cfg(test)]
+mod test {
+  use super::*;
+
+  #[tokio::test]
+  async fn zip_round_trip() -> Result<(), HandleError> {
+    let store_td = tempfile::tempdir()?;
+    let handles = Handles::new(store_td.path())?;
+
+    let td = tempfile::tempdir()?;
+    std::fs::write(td.path().join("a.txt"), "wow\n")?;
+    std::fs::write(td.path().join("b.txt"), "hey\n")?;
+    std::fs::create_dir(td.path().join("c"))?;
+    std::fs::write(td.path().join("c/d.txt"), "oh\n")?;
+    std::fs::create_dir(td.path().join("c/e"))?;
+    std::fs::write(td.path().join("c/e/f.txt"), "yeah\n")?;
+
+    let buf = io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(buf);
+    let options = zip::write::FileOptions::default().last_modified_time(DateTime::zero());
+    zip.start_file("a.txt", options)?;
+    io::copy(
+      &mut std::fs::OpenOptions::new()
+        .read(true)
+        .open(td.path().join("a.txt"))?,
+      &mut zip,
+    )?;
+    zip.start_file("b.txt", options)?;
+    io::copy(
+      &mut std::fs::OpenOptions::new()
+        .read(true)
+        .open(td.path().join("b.txt"))?,
+      &mut zip,
+    )?;
+    zip.add_directory("c", options)?;
+    zip.start_file("c/d.txt", options)?;
+    io::copy(
+      &mut std::fs::OpenOptions::new()
+        .read(true)
+        .open(td.path().join("c/d.txt"))?,
+      &mut zip,
+    )?;
+    zip.add_directory("c/e", options)?;
+    zip.start_file("c/e/f.txt", options)?;
+    io::copy(
+      &mut std::fs::OpenOptions::new()
+        .read(true)
+        .open(td.path().join("c/e/f.txt"))?,
+      &mut zip,
+    )?;
+    let buf = zip.finish()?;
+    let zip = zip::ZipArchive::new(buf)?;
+    let manual_zip_dir_digest = handles.store_zip_entries(zip).await?;
+    let manual_zip_snapshot = handles.load_snapshot(manual_zip_dir_digest.clone()).await?;
+
+    let globs = fs::PreparedPathGlobs::create(
+      vec!["**/*.txt".to_string()],
+      fs::StrictGlobMatching::Ignore,
+      fs::GlobExpansionConjunction::AnyMatch,
+    )?;
+    /* Assert that the manually generated zip file produces the same checksums as crawling the
+     * directory. */
+    let snapshot = handles.expand_globs(td.path(), globs.clone()).await?;
+    assert_eq!(manual_zip_snapshot, snapshot);
+    let dir_digest: fs::DirectoryDigest = snapshot.clone().into();
+    assert_eq!(dir_digest, manual_zip_dir_digest);
+
+    let extract_td = tempfile::tempdir()?;
+    let buf = io::Cursor::new(Vec::new());
+    let zip = zip::ZipWriter::new(buf);
+    let mut zip = handles.synthesize_zip_file(dir_digest.clone(), zip).await?;
+    let buf = zip.finish()?;
+    let mut zip = zip::ZipArchive::new(buf)?;
+    zip.extract(&extract_td)?;
+    /* Assert that crawling the directory after extracting the synthesized zip file produces the
+     * same checksums. */
+    let extracted_snapshot = handles.expand_globs(extract_td.path(), globs).await?;
+    assert_eq!(extracted_snapshot, snapshot);
+    let extracted_dir_digest: fs::DirectoryDigest = extracted_snapshot.into();
+    assert_eq!(extracted_dir_digest, dir_digest);
+
+    Ok(())
+  }
+}
