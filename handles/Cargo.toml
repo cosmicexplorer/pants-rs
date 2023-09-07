@@ -12,7 +12,6 @@ repository.workspace    = true
 
 [dependencies]
 async-stream.workspace  = true
-async-trait.workspace   = true
 bytes.workspace         = true
 displaydoc.workspace    = true
 fs.workspace            = true

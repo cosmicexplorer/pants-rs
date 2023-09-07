@@ -55,7 +55,6 @@ pub use store;
 pub use task_executor::Executor;
 
 use async_stream::try_stream;
-use async_trait::async_trait;
 pub use bytes::Bytes;
 use displaydoc::Display;
 use futures_util::pin_mut;
@@ -113,25 +112,36 @@ pub enum PathTransformError {
   MalformedZipName(String),
 }
 
-/// Task executor resources with support for a main loop and trailing tasks.
-pub trait HasExecutor {
-  /// A handle to a pants task executor.
+trait HasExecutor {
   fn executor(&self) -> &Executor;
 }
 
+trait HasStore {
+  fn store(&self) -> &store::Store;
+}
+
 /// Efficiently traverse the local disk and enter file contents in the persistent byte store.
-#[async_trait]
-pub trait Crawler {
+#[derive(Debug, Clone)]
+pub struct Crawler {
+  handles: Handles,
+}
+
+impl Crawler {
+  pub(crate) fn new(handles: Handles) -> Self {
+    Self { handles }
+  }
+
   /// Crawl the filesystem and enter every matching entry into the local store.
   ///
   ///```
   /// # fn main() -> Result<(), executor_resource_handles::HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{Crawler, Handles};
+  /// use executor_resource_handles::Handles;
   /// use tempfile::tempdir;
   /// use std::{path::PathBuf, str::FromStr};
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let crawler = handles.crawler();
   ///
   /// let td = tempdir()?;
   /// std::fs::write(td.path().join("a.txt"), "wow\n")?;
@@ -142,7 +152,7 @@ pub trait Crawler {
   ///   fs::StrictGlobMatching::Ignore,
   ///   fs::GlobExpansionConjunction::AnyMatch,
   /// )?;
-  /// let snapshot = handles.expand_globs(td.path(), globs).await?;
+  /// let snapshot = crawler.expand_globs(td.path(), globs).await?;
   /// assert_eq!(snapshot.files(), vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
   /// let dir_digest: fs::DirectoryDigest = snapshot.into();
   /// let digest = dir_digest.as_digest();
@@ -152,32 +162,73 @@ pub trait Crawler {
   /// # Ok(())
   /// # })}
   ///```
-  async fn expand_globs(
+  pub async fn expand_globs(
     &self,
-    root: &Path,
+    root: impl AsRef<Path>,
     path_globs: fs::PreparedPathGlobs,
-  ) -> Result<store::Snapshot, HandleError>;
+  ) -> Result<store::Snapshot, HandleError> {
+    use fs::GlobMatching;
+
+    let vfs = Arc::new(self.create_vfs(root.as_ref())?);
+    let path_stats = vfs
+      .expand_globs(path_globs, fs::SymlinkBehavior::Aware, None)
+      .await
+      .map_err(|err| format!("Error expanding globs: {err}"))?;
+    Ok(
+      store::Snapshot::from_path_stats(
+        store::OneOffStoreFileByDigest::new(self.handles.store().clone(), vfs, true),
+        path_stats,
+      )
+      .await?,
+    )
+  }
+
+  fn create_vfs(&self, root: &Path) -> Result<fs::PosixFS, HandleError> {
+    Ok(fs::PosixFS::new_with_symlink_behavior(
+      root,
+      /* TODO: add this as an option when creating a Handles! */
+      fs::GitignoreStyleExcludes::empty(),
+      self.handles.executor().clone(),
+      /* TODO: add this as an option when creating a Handles! */
+      fs::SymlinkBehavior::Oblivious,
+    )?)
+  }
 }
 
 /// Enter and retrieve byte streams to and from the local store.
-#[async_trait]
-pub trait ByteStore {
+#[derive(Debug, Clone)]
+pub struct ByteStore {
+  handles: Handles,
+}
+
+impl HasStore for ByteStore {
+  fn store(&self) -> &store::Store {
+    self.handles.store()
+  }
+}
+
+impl ByteStore {
+  pub(crate) fn new(handles: Handles) -> Self {
+    Self { handles }
+  }
+
   /// Store a small byte chunk.
   ///
   /// *NB: Use [`Self::store_streaming_file`] to stream in larger files.*
   ///
   ///```
   /// # fn main() -> Result<(), executor_resource_handles::HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{ByteStore, Handles};
+  /// use executor_resource_handles::Handles;
   /// use bytes::Bytes;
   /// use tempfile::tempdir;
   /// use std::str::FromStr;
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let byte_store = handles.byte_store();
   ///
   /// let msg = Bytes::copy_from_slice(b"wow\n");
-  /// let digest = handles.store_small_bytes(msg, true).await?;
+  /// let digest = byte_store.store_small_bytes(msg, true).await?;
   ///
   /// let fp: hashing::Fingerprint =
   ///   hashing::Fingerprint::from_str("f40cd21f276e47d533371afce1778447e858eb5c9c0c0ed61c65f5c5d57caf63")?;
@@ -186,23 +237,26 @@ pub trait ByteStore {
   /// # Ok(())
   /// # })}
   ///```
-  async fn store_small_bytes(
+  pub async fn store_small_bytes(
     &self,
     bytes: Bytes,
     initial_lease: bool,
-  ) -> Result<hashing::Digest, HandleError>;
+  ) -> Result<hashing::Digest, HandleError> {
+    Ok(self.store().store_file_bytes(bytes, initial_lease).await?)
+  }
 
   /// Store multiple small byte chunks.
   ///
   ///```
   /// # fn main() -> Result<(), executor_resource_handles::HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{ByteStore, Handles};
+  /// use executor_resource_handles::Handles;
   /// use bytes::Bytes;
   /// use tempfile::tempdir;
   /// use std::str::FromStr;
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let byte_store = handles.byte_store();
   ///
   /// let msg = Bytes::copy_from_slice(b"wow\n");
   /// let fp: hashing::Fingerprint =
@@ -211,38 +265,46 @@ pub trait ByteStore {
   /// let fp2: hashing::Fingerprint =
   ///   hashing::Fingerprint::from_str("4e955fea0268518cbaa500409dfbec88f0ecebad28d84ecbe250baed97dba889")?;
   ///
-  /// handles.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
+  /// byte_store.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
   ///
   /// let digest = hashing::Digest { hash: fp, size_bytes: 4 };
   /// let digest2 = hashing::Digest { hash: fp2, size_bytes: 4 };
   ///
-  /// assert_eq!(msg, handles.load_file_bytes_with(digest, Bytes::copy_from_slice).await?);
-  /// assert_eq!(msg2, handles.load_file_bytes_with(digest2, Bytes::copy_from_slice).await?);
+  /// assert_eq!(msg, byte_store.load_file_bytes_with(digest, Bytes::copy_from_slice).await?);
+  /// assert_eq!(msg2, byte_store.load_file_bytes_with(digest2, Bytes::copy_from_slice).await?);
   /// # Ok(())
   /// # })}
   ///```
-  async fn store_small_bytes_batch(
+  pub async fn store_small_bytes_batch(
     &self,
     items: Vec<(hashing::Fingerprint, Bytes)>,
     initial_lease: bool,
-  ) -> Result<(), HandleError>;
+  ) -> Result<(), HandleError> {
+    Ok(
+      self
+        .store()
+        .store_file_bytes_batch(items, initial_lease)
+        .await?,
+    )
+  }
 
   /// Stream in the contents of `src` to the local store.
   ///
   ///```
   /// # fn main() -> Result<(), executor_resource_handles::HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{ByteStore, Handles};
+  /// use executor_resource_handles::Handles;
   /// use tempfile::tempdir;
   /// use std::str::FromStr;
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let byte_store = handles.byte_store();
   ///
   /// let td = tempdir()?;
   /// let out_path = td.path().join("c.txt");
   /// std::fs::write(&out_path, b"hello!!!\n")?;
   ///
-  /// let resulting_digest = handles.store_streaming_file(true, true, out_path).await?;
+  /// let resulting_digest = byte_store.store_streaming_file(true, true, out_path).await?;
   ///
   /// let fp = hashing::Fingerprint::from_str("d1d23437b40e63d96c9bdd7458e1a61a72b70910d4f053744303f5165d64cbfd")?;
   /// let digest = hashing::Digest { hash: fp, size_bytes: 9 };
@@ -250,67 +312,80 @@ pub trait ByteStore {
   /// # Ok(())
   /// # })}
   ///```
-  async fn store_streaming_file(
+  pub async fn store_streaming_file(
     &self,
     initial_lease: bool,
     data_is_immutable: bool,
     src: PathBuf,
-  ) -> Result<hashing::Digest, HandleError>;
+  ) -> Result<hashing::Digest, HandleError> {
+    Ok(
+      self
+        .store()
+        .store_file(initial_lease, data_is_immutable, src)
+        .await?,
+    )
+  }
 
   /// Remove the entry for `digest` from the local store.
   ///
   ///```
   /// # use executor_resource_handles::HandleError;
   /// # fn main() -> Result<(), executor_resource_handles::HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{ByteStore, Handles};
+  /// use executor_resource_handles::Handles;
   /// use bytes::Bytes;
   /// use tempfile::tempdir;
   /// use std::str::FromStr;
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let byte_store = handles.byte_store();
   ///
   /// let msg = Bytes::copy_from_slice(b"wow\n");
-  /// let digest = handles.store_small_bytes(msg.clone(), true).await?;
+  /// let digest = byte_store.store_small_bytes(msg.clone(), true).await?;
   ///
   /// let fp: hashing::Fingerprint =
   ///   hashing::Fingerprint::from_str("f40cd21f276e47d533371afce1778447e858eb5c9c0c0ed61c65f5c5d57caf63")?;
   /// assert_eq!(digest, hashing::Digest { hash: fp, size_bytes: 4 });
   ///
-  /// assert_eq!(msg, handles.load_file_bytes_with(digest, Bytes::copy_from_slice).await?);
+  /// assert_eq!(msg, byte_store.load_file_bytes_with(digest, Bytes::copy_from_slice).await?);
   ///
-  /// assert!(handles.remove_entry(digest).await?);
+  /// assert!(byte_store.remove_entry(digest).await?);
   ///
-  /// match handles.load_file_bytes_with(digest, Bytes::copy_from_slice).await {
+  /// match byte_store.load_file_bytes_with(digest, Bytes::copy_from_slice).await {
   ///   Err(HandleError::Store(store::StoreError::MissingDigest(_, _))) => (),
   ///   _ => unreachable!(),
   /// }
   /// # Ok(())
   /// # })}
   ///```
-  async fn remove_entry(&self, digest: hashing::Digest) -> Result<bool, HandleError>;
+  pub async fn remove_entry(&self, digest: hashing::Digest) -> Result<bool, HandleError> {
+    Ok(self.store().remove_file(digest).await?)
+  }
 
   /// Extract the byte string corresponding to `digest` from the local store.
-  async fn load_file_bytes_with<
+  pub async fn load_file_bytes_with<
     T: Send + 'static,
     F: Fn(&[u8]) -> T + Clone + Send + Sync + 'static,
   >(
     &self,
     digest: hashing::Digest,
     f: F,
-  ) -> Result<T, HandleError>;
+  ) -> Result<T, HandleError> {
+    Ok(self.store().load_file_bytes_with::<T, F>(digest, f).await?)
+  }
 
   /// Enter an arbitrary readable stream in the local store by writing it to a temporary file.
   ///
   ///```
   /// # use executor_resource_handles::HandleError;
   /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{ByteStore, Handles};
+  /// use executor_resource_handles::Handles;
   /// use tempfile::tempdir;
   /// use std::str::FromStr;
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let byte_store = handles.byte_store();
   ///
   /// let td = tempdir()?;
   /// let file_path = td.path().join("asdf.txt");
@@ -318,7 +393,7 @@ pub trait ByteStore {
   /// let digest = {
   ///   std::fs::write(&file_path, b"wowowow\n")?;
   ///   let f = std::fs::OpenOptions::new().read(true).open(&file_path)?;
-  ///   handles.store_byte_stream(true, f).await?
+  ///   byte_store.store_byte_stream(true, f).await?
   /// };
   /// let fp =
   ///   hashing::Fingerprint::from_str("9da8e466dd1600e44f79f691d111d7d95dd02c70f8d92328fca0653daba85ae8")?;
@@ -326,7 +401,7 @@ pub trait ByteStore {
   /// # Ok(())
   /// # })}
   ///```
-  async fn store_byte_stream<R: io::Read + Send>(
+  pub async fn store_byte_stream<R: io::Read + Send>(
     &self,
     initial_lease: bool,
     src: R,
@@ -346,12 +421,13 @@ pub trait ByteStore {
   ///```
   /// # use executor_resource_handles::HandleError;
   /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{ByteStore, Handles};
+  /// use executor_resource_handles::Handles;
   /// use tempfile::tempdir;
   /// use std::str::FromStr;
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let byte_store = handles.byte_store();
   ///
   /// let td = tempdir()?;
   /// let file_path = td.path().join("asdf.txt");
@@ -359,7 +435,7 @@ pub trait ByteStore {
   /// let digest = {
   ///   std::fs::write(&file_path, b"wowowow\n")?;
   ///   let f = tokio::fs::OpenOptions::new().read(true).open(&file_path).await?;
-  ///   handles.store_async_byte_stream(true, f).await?
+  ///   byte_store.store_async_byte_stream(true, f).await?
   /// };
   /// let fp =
   ///   hashing::Fingerprint::from_str("9da8e466dd1600e44f79f691d111d7d95dd02c70f8d92328fca0653daba85ae8")?;
@@ -367,7 +443,7 @@ pub trait ByteStore {
   /// # Ok(())
   /// # })}
   ///```
-  async fn store_async_byte_stream<R: tokio::io::AsyncRead + Send + Unpin>(
+  pub async fn store_async_byte_stream<R: tokio::io::AsyncRead + Send + Unpin>(
     &self,
     initial_lease: bool,
     src: R,
@@ -434,26 +510,42 @@ impl<R> ops::Drop for Reader<R> {
 }
 
 /// Compose byte contents with relative paths to form virtual directory trees.
-#[async_trait]
-pub trait DirectoryStore {
+#[derive(Debug, Clone)]
+pub struct DirectoryStore {
+  byte_store: ByteStore,
+}
+
+impl HasStore for DirectoryStore {
+  fn store(&self) -> &store::Store {
+    self.byte_store.store()
+  }
+}
+
+impl DirectoryStore {
+  pub(crate) fn new(byte_store: ByteStore) -> Self {
+    Self { byte_store }
+  }
+
   /// Assign the file contents from `digest` to the file at `name`.
   ///
   ///```
   /// # use executor_resource_handles::HandleError;
   /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{ByteStore, DirectoryStore, Handles};
+  /// use executor_resource_handles::Handles;
   /// use bytes::Bytes;
   /// use tempfile::tempdir;
   /// use std::path::PathBuf;
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let byte_store = handles.byte_store();
+  /// let dir_store = handles.directory_store();
   ///
   /// let msg = Bytes::copy_from_slice(b"wow\n");
-  /// let digest = handles.store_small_bytes(msg.clone(), true).await?;
+  /// let digest = byte_store.store_small_bytes(msg.clone(), true).await?;
   ///
   /// let name = fs::RelativePath::new("asdf.txt")?;
-  /// let snapshot = handles.snapshot_of_one_file(name, digest, false).await?;
+  /// let snapshot = dir_store.snapshot_of_one_file(name, digest, false).await?;
   /// assert_eq!(snapshot.files(), vec![PathBuf::from("asdf.txt")]);
   /// assert!(snapshot.directories().is_empty());
   /// let dir_digest: fs::DirectoryDigest = snapshot.into();
@@ -462,25 +554,34 @@ pub trait DirectoryStore {
   /// # Ok(())
   /// # })}
   ///```
-  async fn snapshot_of_one_file(
+  pub async fn snapshot_of_one_file(
     &self,
     name: fs::RelativePath,
     digest: hashing::Digest,
     is_executable: bool,
-  ) -> Result<store::Snapshot, HandleError>;
+  ) -> Result<store::Snapshot, HandleError> {
+    Ok(
+      self
+        .store()
+        .snapshot_of_one_file(name, digest, is_executable)
+        .await?,
+    )
+  }
 
   /// Recursively store all components of `tree` in the local store.
   ///
   ///```
   /// # use executor_resource_handles::HandleError;
   /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{ByteStore, DirectoryStore, Handles};
+  /// use executor_resource_handles::Handles;
   /// use bytes::Bytes;
   /// use tempfile::tempdir;
   /// use std::{path::{Path, PathBuf}, str::FromStr};
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let byte_store = handles.byte_store();
+  /// let dir_store = handles.directory_store();
   ///
   /// let msg = Bytes::copy_from_slice(b"wow\n");
   /// let fp: hashing::Fingerprint =
@@ -489,7 +590,7 @@ pub trait DirectoryStore {
   /// let fp2: hashing::Fingerprint =
   ///   hashing::Fingerprint::from_str("4e955fea0268518cbaa500409dfbec88f0ecebad28d84ecbe250baed97dba889")?;
   ///
-  /// handles.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
+  /// byte_store.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
   ///
   /// let digest = hashing::Digest { hash: fp, size_bytes: 4 };
   /// let digest2 = hashing::Digest { hash: fp2, size_bytes: 4 };
@@ -505,7 +606,7 @@ pub trait DirectoryStore {
   ///   ].into_iter().collect(),
   /// )?;
   ///
-  /// let dir_digest = handles.record_digest_trie(digest_trie, true).await?;
+  /// let dir_digest = dir_store.record_digest_trie(digest_trie, true).await?;
   /// assert_eq!(4, dir_digest.digests().len());
   /// assert_eq!(digest, dir_digest.digests()[2]);
   /// assert_eq!(digest2, dir_digest.digests()[1]);
@@ -517,24 +618,28 @@ pub trait DirectoryStore {
   /// # Ok(())
   /// # })}
   ///```
-  async fn record_digest_trie(
+  pub async fn record_digest_trie(
     &self,
     tree: fs::DigestTrie,
     initial_lease: bool,
-  ) -> Result<fs::DirectoryDigest, HandleError>;
+  ) -> Result<fs::DirectoryDigest, HandleError> {
+    Ok(self.store().record_digest_trie(tree, initial_lease).await?)
+  }
 
   /// Expand the symbolic directory tree associated with `digest`.
   ///
   ///```
   /// # use executor_resource_handles::HandleError;
   /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{ByteStore, DirectoryStore, Handles};
+  /// use executor_resource_handles::Handles;
   /// use bytes::Bytes;
   /// use tempfile::tempdir;
   /// use std::{path::{Path, PathBuf}, str::FromStr};
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let byte_store = handles.byte_store();
+  /// let dir_store = handles.directory_store();
   ///
   /// let msg = Bytes::copy_from_slice(b"wow\n");
   /// let fp: hashing::Fingerprint =
@@ -543,7 +648,7 @@ pub trait DirectoryStore {
   /// let fp2: hashing::Fingerprint =
   ///   hashing::Fingerprint::from_str("4e955fea0268518cbaa500409dfbec88f0ecebad28d84ecbe250baed97dba889")?;
   ///
-  /// handles.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
+  /// byte_store.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
   ///
   /// let digest = hashing::Digest { hash: fp, size_bytes: 4 };
   /// let digest2 = hashing::Digest { hash: fp2, size_bytes: 4 };
@@ -559,31 +664,35 @@ pub trait DirectoryStore {
   ///   ].into_iter().collect(),
   /// )?;
   ///
-  /// let dir_digest = handles.record_digest_trie(digest_trie.clone(), true).await?;
+  /// let dir_digest = dir_store.record_digest_trie(digest_trie.clone(), true).await?;
   /// assert_eq!(
   ///   digest_trie.as_remexec_directory(),
-  ///   handles.load_digest_trie(dir_digest).await?.as_remexec_directory(),
+  ///   dir_store.load_digest_trie(dir_digest).await?.as_remexec_directory(),
   /// );
   /// # Ok(())
   /// # })}
   ///```
-  async fn load_digest_trie(
+  pub async fn load_digest_trie(
     &self,
     digest: fs::DirectoryDigest,
-  ) -> Result<fs::DigestTrie, HandleError>;
+  ) -> Result<fs::DigestTrie, HandleError> {
+    Ok(self.store().load_digest_trie(digest).await?)
+  }
 
   /// Extract a directory structure from the given `digest`.
   ///
   ///```
   /// # use executor_resource_handles::HandleError;
   /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{ByteStore, DirectoryStore, Handles};
+  /// use executor_resource_handles::Handles;
   /// use bytes::Bytes;
   /// use tempfile::tempdir;
   /// use std::{path::{Path, PathBuf}, str::FromStr};
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let byte_store = handles.byte_store();
+  /// let dir_store = handles.directory_store();
   ///
   /// let msg = Bytes::copy_from_slice(b"wow\n");
   /// let fp: hashing::Fingerprint =
@@ -592,7 +701,7 @@ pub trait DirectoryStore {
   /// let fp2: hashing::Fingerprint =
   ///   hashing::Fingerprint::from_str("4e955fea0268518cbaa500409dfbec88f0ecebad28d84ecbe250baed97dba889")?;
   ///
-  /// handles.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
+  /// byte_store.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
   ///
   /// let digest = hashing::Digest { hash: fp, size_bytes: 4 };
   /// let digest2 = hashing::Digest { hash: fp2, size_bytes: 4 };
@@ -608,28 +717,32 @@ pub trait DirectoryStore {
   ///   ].into_iter().collect(),
   /// )?;
   ///
-  /// let dir_digest = handles.record_digest_trie(digest_trie.clone(), true).await?;
-  /// assert_eq!(dir_digest, handles.load_directory_digest(dir_digest.as_digest()).await?);
+  /// let dir_digest = dir_store.record_digest_trie(digest_trie.clone(), true).await?;
+  /// assert_eq!(dir_digest, dir_store.load_directory_digest(dir_digest.as_digest()).await?);
   /// # Ok(())
   /// # })}
   ///```
-  async fn load_directory_digest(
+  pub async fn load_directory_digest(
     &self,
     digest: hashing::Digest,
-  ) -> Result<fs::DirectoryDigest, HandleError>;
+  ) -> Result<fs::DirectoryDigest, HandleError> {
+    Ok(self.store().load_directory_digest(digest).await?)
+  }
 
   /// Generate a snapshot by enumerating file paths from `digest`.
   ///
   ///```
   /// # use executor_resource_handles::HandleError;
   /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{ByteStore, DirectoryStore, Handles};
+  /// use executor_resource_handles::Handles;
   /// use bytes::Bytes;
   /// use tempfile::tempdir;
   /// use std::{path::{Path, PathBuf}, str::FromStr};
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let byte_store = handles.byte_store();
+  /// let dir_store = handles.directory_store();
   ///
   /// let msg = Bytes::copy_from_slice(b"wow\n");
   /// let fp: hashing::Fingerprint =
@@ -638,7 +751,7 @@ pub trait DirectoryStore {
   /// let fp2: hashing::Fingerprint =
   ///   hashing::Fingerprint::from_str("4e955fea0268518cbaa500409dfbec88f0ecebad28d84ecbe250baed97dba889")?;
   ///
-  /// handles.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
+  /// byte_store.store_small_bytes_batch(vec![(fp, msg.clone()), (fp2, msg2.clone())], true).await?;
   ///
   /// let digest = hashing::Digest { hash: fp, size_bytes: 4 };
   /// let digest2 = hashing::Digest { hash: fp2, size_bytes: 4 };
@@ -654,34 +767,49 @@ pub trait DirectoryStore {
   ///   ].into_iter().collect(),
   /// )?;
   ///
-  /// let dir_digest = handles.record_digest_trie(digest_trie.clone(), true).await?;
-  /// let snapshot = handles.load_snapshot(dir_digest).await?;
+  /// let dir_digest = dir_store.record_digest_trie(digest_trie.clone(), true).await?;
+  /// let snapshot = dir_store.load_snapshot(dir_digest).await?;
   /// assert_eq!(snapshot.files(), vec![PathBuf::from("a/a.txt"), PathBuf::from("a/b.txt")]);
   /// assert_eq!(snapshot.directories(), vec![PathBuf::from("a")]);
   /// # Ok(())
   /// # })}
   ///```
-  async fn load_snapshot(
+  pub async fn load_snapshot(
     &self,
     digest: fs::DirectoryDigest,
-  ) -> Result<store::Snapshot, HandleError>;
+  ) -> Result<store::Snapshot, HandleError> {
+    Ok(store::Snapshot::from_digest(self.store().clone(), digest).await?)
+  }
 }
 
 /// Manipulate zip files as directory trees.
-#[async_trait]
-pub trait ZipFileStore {
+#[derive(Debug, Clone)]
+pub struct ZipFileStore {
+  byte_store: ByteStore,
+  directory_store: DirectoryStore,
+}
+
+impl ZipFileStore {
+  pub(crate) fn new(byte_store: ByteStore, directory_store: DirectoryStore) -> Self {
+    Self {
+      byte_store,
+      directory_store,
+    }
+  }
+
   /// Enter the contents of `archive` into the local store as a directory tree.
   ///
   ///```
   /// # use executor_resource_handles::HandleError;
   /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{ZipFileStore, Handles};
+  /// use executor_resource_handles::Handles;
   /// use tempfile::tempdir;
   /// use zip::{ZipArchive, ZipWriter, write::FileOptions};
   /// use std::{io::{Write, Cursor}, str::FromStr};
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let zip_store = handles.zip_file_store();
   ///
   /// let buf = Cursor::new(Vec::new());
   /// let mut zip = ZipWriter::new(buf);
@@ -691,7 +819,7 @@ pub trait ZipFileStore {
   /// let buf = zip.finish()?;
   ///
   /// let zip = ZipArchive::new(buf)?;
-  /// let dir_digest = handles.store_zip_entries(zip).await?;
+  /// let dir_digest = zip_store.store_zip_entries(zip).await?;
   /// let digest = hashing::Digest {
   ///   hash: hashing::Fingerprint::from_str("a44a45978694cc8277b5df3ca4de74e7a6c3a8230e714937b96f3a0bcee68308")?,
   ///   size_bytes: 89,
@@ -700,23 +828,54 @@ pub trait ZipFileStore {
   /// # Ok(())
   /// # })}
   ///```
-  async fn store_zip_entries<R: io::Read + io::Seek + Send>(
+  pub async fn store_zip_entries<R: io::Read + io::Seek + Send>(
     &self,
     archive: zip::ZipArchive<R>,
-  ) -> Result<fs::DirectoryDigest, HandleError>;
+  ) -> Result<fs::DirectoryDigest, HandleError> {
+    let mut path_stats: Vec<fs::PathStat> = Vec::new();
+    let mut file_digests: HashMap<PathBuf, hashing::Digest> = HashMap::new();
+
+    let archive = ZipReader::new(archive);
+    let s = archive.stream_entries().await;
+    pin_mut!(s);
+
+    while let Some(ret) = s.next().await {
+      let (stat, tmp_path) = ret?;
+      if let Some(tmp_path) = tmp_path {
+        let digest = self
+          .byte_store
+          .store_streaming_file(true, true, tmp_path.to_path_buf())
+          .await?;
+        /* NB: We ignore duplicate filenames, although their contents are always still entered. */
+        let _ = file_digests.insert(stat.path().to_path_buf(), digest);
+      }
+      path_stats.push(stat);
+    }
+
+    let path_stats = path_stats
+      .iter()
+      .map(fs::directory::TypedPath::from)
+      .collect();
+    let digest_trie = fs::directory::DigestTrie::from_unique_paths(path_stats, &file_digests)?;
+    self
+      .directory_store
+      .record_digest_trie(digest_trie, true)
+      .await
+  }
 
   /// Extract the contents of `digest` into `archive`.
   ///
   ///```
   /// # use executor_resource_handles::HandleError;
   /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
-  /// use executor_resource_handles::{ZipFileStore, Handles};
+  /// use executor_resource_handles::Handles;
   /// use tempfile::tempdir;
   /// use zip::{ZipArchive, ZipWriter, write::FileOptions};
   /// use std::{io::{Write, Cursor}, str::FromStr};
   ///
   /// let store_td = tempdir()?;
   /// let handles = Handles::new(store_td.path())?;
+  /// let zip_store = handles.zip_file_store();
   ///
   /// let buf = Cursor::new(Vec::new());
   /// let mut zip = ZipWriter::new(buf);
@@ -726,7 +885,7 @@ pub trait ZipFileStore {
   /// let buf = zip.finish()?;
   ///
   /// let zip = ZipArchive::new(buf)?;
-  /// let dir_digest = handles.store_zip_entries(zip).await?;
+  /// let dir_digest = zip_store.store_zip_entries(zip).await?;
   /// let digest = hashing::Digest {
   ///   hash: hashing::Fingerprint::from_str("a44a45978694cc8277b5df3ca4de74e7a6c3a8230e714937b96f3a0bcee68308")?,
   ///   size_bytes: 89,
@@ -735,7 +894,7 @@ pub trait ZipFileStore {
   ///
   /// let buf = Cursor::new(Vec::new());
   /// let zip = ZipWriter::new(buf);
-  /// let mut zip = handles.synthesize_zip_file(dir_digest, zip).await?;
+  /// let mut zip = zip_store.synthesize_zip_file(dir_digest, zip).await?;
   /// let buf = zip.finish()?;
   ///
   /// let mut zip = ZipArchive::new(buf)?;
@@ -746,14 +905,57 @@ pub trait ZipFileStore {
   /// # Ok(())
   /// # })}
   ///```
-  async fn synthesize_zip_file<W: io::Write + io::Seek + Send>(
+  pub async fn synthesize_zip_file<W: io::Write + io::Seek + Send>(
     &self,
     digest: fs::DirectoryDigest,
-    archive: zip::ZipWriter<W>,
-  ) -> Result<zip::ZipWriter<W>, HandleError>;
+    mut archive: zip::ZipWriter<W>,
+  ) -> Result<zip::ZipWriter<W>, HandleError> {
+    let digest_trie = self.directory_store.load_digest_trie(digest).await?;
+
+    let mut entries: Vec<(PathBuf, fs::directory::Entry)> = Vec::new();
+    digest_trie.walk(
+      fs::SymlinkBehavior::Oblivious,
+      &mut |path: &Path, entry: &fs::directory::Entry| {
+        if path.as_os_str().is_empty() {
+          /* Ignore the top-level directory, as that does not have a corresponding entry in the zip
+           * file. */
+          assert!(matches![entry, fs::directory::Entry::Directory(_)]);
+        } else {
+          entries.push((path.to_path_buf(), entry.clone()));
+        }
+      },
+    );
+
+    /* FIXME: explicitly use DateTime::zero() when https://github.com/zip-rs/zip/pull/399 is
+     * merged! */
+    let options = zip::write::FileOptions::default().last_modified_time(DateTime::default());
+
+    for (path, entry) in entries.into_iter() {
+      let path = format!("{}", path.display());
+      dbg!(&path);
+      dbg!(&entry);
+      match entry {
+        fs::directory::Entry::Directory(_) => {
+          archive.add_directory(path, options)?;
+        },
+        fs::directory::Entry::File(f) => {
+          archive.start_file(path, options)?;
+          let bytes = self
+            .byte_store
+            .load_file_bytes_with(f.digest(), Bytes::copy_from_slice)
+            .await?;
+          archive.write_all(&bytes)?;
+        },
+        _ => unreachable!("we chose SymlinkBehavior::Oblivious!"),
+      }
+    }
+
+    Ok(archive)
+  }
 }
 
 /// Execution and storage context.
+#[derive(Debug, Clone)]
 pub struct Handles {
   executor: Executor,
   fs_store: store::Store,
@@ -785,15 +987,24 @@ impl Handles {
     })
   }
 
-  pub(crate) fn create_vfs(&self, root: &Path) -> Result<fs::PosixFS, HandleError> {
-    Ok(fs::PosixFS::new_with_symlink_behavior(
-      root,
-      /* TODO: add this as an option when creating a Handles! */
-      fs::GitignoreStyleExcludes::empty(),
-      self.executor().clone(),
-      /* TODO: add this as an option when creating a Handles! */
-      fs::SymlinkBehavior::Oblivious,
-    )?)
+  /// Produce a crawler using the resources owned by this handle.
+  pub fn crawler(&self) -> Crawler {
+    Crawler::new(self.clone())
+  }
+
+  /// Produce a byte store using the resources owned by this handle.
+  pub fn byte_store(&self) -> ByteStore {
+    ByteStore::new(self.clone())
+  }
+
+  /// Produce a directory store using the resources owned by this handle.
+  pub fn directory_store(&self) -> DirectoryStore {
+    DirectoryStore::new(self.byte_store())
+  }
+
+  /// Produce a zip file store using the resources owned by this handle.
+  pub fn zip_file_store(&self) -> ZipFileStore {
+    ZipFileStore::new(self.byte_store(), self.directory_store())
   }
 }
 
@@ -803,217 +1014,9 @@ impl HasExecutor for Handles {
   }
 }
 
-#[async_trait]
-impl Crawler for Handles {
-  async fn expand_globs(
-    &self,
-    root: &Path,
-    path_globs: fs::PreparedPathGlobs,
-  ) -> Result<store::Snapshot, HandleError> {
-    use fs::GlobMatching;
-
-    let vfs = Arc::new(self.create_vfs(root)?);
-    let path_stats = vfs
-      .expand_globs(path_globs, fs::SymlinkBehavior::Aware, None)
-      .await
-      .map_err(|err| format!("Error expanding globs: {err}"))?;
-    Ok(
-      store::Snapshot::from_path_stats(
-        store::OneOffStoreFileByDigest::new(self.fs_store.clone(), vfs, true),
-        path_stats,
-      )
-      .await?,
-    )
-  }
-}
-
-#[async_trait]
-impl ByteStore for Handles {
-  async fn store_small_bytes(
-    &self,
-    bytes: Bytes,
-    initial_lease: bool,
-  ) -> Result<hashing::Digest, HandleError> {
-    Ok(self.fs_store.store_file_bytes(bytes, initial_lease).await?)
-  }
-
-  async fn store_small_bytes_batch(
-    &self,
-    items: Vec<(hashing::Fingerprint, Bytes)>,
-    initial_lease: bool,
-  ) -> Result<(), HandleError> {
-    Ok(
-      self
-        .fs_store
-        .store_file_bytes_batch(items, initial_lease)
-        .await?,
-    )
-  }
-
-  async fn store_streaming_file(
-    &self,
-    initial_lease: bool,
-    data_is_immutable: bool,
-    src: PathBuf,
-  ) -> Result<hashing::Digest, HandleError> {
-    Ok(
-      self
-        .fs_store
-        .store_file(initial_lease, data_is_immutable, src)
-        .await?,
-    )
-  }
-
-  async fn remove_entry(&self, digest: hashing::Digest) -> Result<bool, HandleError> {
-    Ok(self.fs_store.remove_file(digest).await?)
-  }
-
-  async fn load_file_bytes_with<
-    T: Send + 'static,
-    F: Fn(&[u8]) -> T + Clone + Send + Sync + 'static,
-  >(
-    &self,
-    digest: hashing::Digest,
-    f: F,
-  ) -> Result<T, HandleError> {
-    Ok(
-      self
-        .fs_store
-        .load_file_bytes_with::<T, F>(digest, f)
-        .await?,
-    )
-  }
-}
-
-#[async_trait]
-impl DirectoryStore for Handles {
-  async fn snapshot_of_one_file(
-    &self,
-    name: fs::RelativePath,
-    digest: hashing::Digest,
-    is_executable: bool,
-  ) -> Result<store::Snapshot, HandleError> {
-    Ok(
-      self
-        .fs_store
-        .snapshot_of_one_file(name, digest, is_executable)
-        .await?,
-    )
-  }
-
-  async fn record_digest_trie(
-    &self,
-    tree: fs::DigestTrie,
-    initial_lease: bool,
-  ) -> Result<fs::DirectoryDigest, HandleError> {
-    Ok(
-      self
-        .fs_store
-        .record_digest_trie(tree, initial_lease)
-        .await?,
-    )
-  }
-
-  async fn load_digest_trie(
-    &self,
-    digest: fs::DirectoryDigest,
-  ) -> Result<fs::DigestTrie, HandleError> {
-    Ok(self.fs_store.load_digest_trie(digest).await?)
-  }
-
-  async fn load_directory_digest(
-    &self,
-    digest: hashing::Digest,
-  ) -> Result<fs::DirectoryDigest, HandleError> {
-    Ok(self.fs_store.load_directory_digest(digest).await?)
-  }
-
-  async fn load_snapshot(
-    &self,
-    digest: fs::DirectoryDigest,
-  ) -> Result<store::Snapshot, HandleError> {
-    Ok(store::Snapshot::from_digest(self.fs_store.clone(), digest).await?)
-  }
-}
-
-#[async_trait]
-impl ZipFileStore for Handles {
-  async fn store_zip_entries<R: io::Read + io::Seek + Send>(
-    &self,
-    archive: zip::ZipArchive<R>,
-  ) -> Result<fs::DirectoryDigest, HandleError> {
-    let mut path_stats: Vec<fs::PathStat> = Vec::new();
-    let mut file_digests: HashMap<PathBuf, hashing::Digest> = HashMap::new();
-
-    let archive = ZipReader::new(archive);
-    let s = archive.stream_entries().await;
-    pin_mut!(s);
-
-    while let Some(ret) = s.next().await {
-      let (stat, tmp_path) = ret?;
-      if let Some(tmp_path) = tmp_path {
-        let digest = self
-          .store_streaming_file(true, true, tmp_path.to_path_buf())
-          .await?;
-        /* NB: We ignore duplicate filenames, although their contents are always still entered. */
-        let _ = file_digests.insert(stat.path().to_path_buf(), digest);
-      }
-      path_stats.push(stat);
-    }
-
-    let path_stats = path_stats
-      .iter()
-      .map(fs::directory::TypedPath::from)
-      .collect();
-    let digest_trie = fs::directory::DigestTrie::from_unique_paths(path_stats, &file_digests)?;
-    self.record_digest_trie(digest_trie, true).await
-  }
-
-  async fn synthesize_zip_file<W: io::Write + io::Seek + Send>(
-    &self,
-    digest: fs::DirectoryDigest,
-    mut archive: zip::ZipWriter<W>,
-  ) -> Result<zip::ZipWriter<W>, HandleError> {
-    let digest_trie = self.load_digest_trie(digest).await?;
-
-    let mut entries: Vec<(PathBuf, fs::directory::Entry)> = Vec::new();
-    digest_trie.walk(
-      fs::SymlinkBehavior::Oblivious,
-      &mut |path: &Path, entry: &fs::directory::Entry| {
-        if path.as_os_str().is_empty() {
-          /* Ignore the top-level directory, as that does not have a corresponding entry in the zip
-           * file. */
-          assert!(matches![entry, fs::directory::Entry::Directory(_)]);
-        } else {
-          entries.push((path.to_path_buf(), entry.clone()));
-        }
-      },
-    );
-
-    /* FIXME: explicitly use DateTime::zero() when https://github.com/zip-rs/zip/pull/399 is
-     * merged! */
-    let options = zip::write::FileOptions::default().last_modified_time(DateTime::default());
-
-    for (path, entry) in entries.into_iter() {
-      let path = format!("{}", path.display());
-      dbg!(&path);
-      dbg!(&entry);
-      match entry {
-        fs::directory::Entry::Directory(_) => {
-          archive.add_directory(path, options)?;
-        },
-        fs::directory::Entry::File(f) => {
-          archive.start_file(path, options)?;
-          let bytes = self
-            .load_file_bytes_with(f.digest(), Bytes::copy_from_slice)
-            .await?;
-          archive.write_all(&bytes)?;
-        },
-        _ => unreachable!("we chose SymlinkBehavior::Oblivious!"),
-      }
-    }
-
-    Ok(archive)
+impl HasStore for Handles {
+  fn store(&self) -> &store::Store {
+    &self.fs_store
   }
 }
 
@@ -1108,6 +1111,9 @@ mod test {
   async fn zip_round_trip() -> Result<(), HandleError> {
     let store_td = tempfile::tempdir()?;
     let handles = Handles::new(store_td.path())?;
+    let crawler = handles.crawler();
+    let dir_store = handles.directory_store();
+    let zip_store = handles.zip_file_store();
 
     let td = tempfile::tempdir()?;
     std::fs::write(td.path().join("a.txt"), "wow\n")?;
@@ -1154,8 +1160,10 @@ mod test {
     )?;
     let buf = zip.finish()?;
     let zip = zip::ZipArchive::new(buf)?;
-    let manual_zip_dir_digest = handles.store_zip_entries(zip).await?;
-    let manual_zip_snapshot = handles.load_snapshot(manual_zip_dir_digest.clone()).await?;
+    let manual_zip_dir_digest = zip_store.store_zip_entries(zip).await?;
+    let manual_zip_snapshot = dir_store
+      .load_snapshot(manual_zip_dir_digest.clone())
+      .await?;
 
     let globs = fs::PreparedPathGlobs::create(
       vec!["**/*.txt".to_string()],
@@ -1164,7 +1172,7 @@ mod test {
     )?;
     /* Assert that the manually generated zip file produces the same checksums as crawling the
      * directory. */
-    let snapshot = handles.expand_globs(td.path(), globs.clone()).await?;
+    let snapshot = crawler.expand_globs(td.path(), globs.clone()).await?;
     assert_eq!(manual_zip_snapshot, snapshot);
     let dir_digest: fs::DirectoryDigest = snapshot.clone().into();
     assert_eq!(dir_digest, manual_zip_dir_digest);
@@ -1172,13 +1180,15 @@ mod test {
     let extract_td = tempfile::tempdir()?;
     let buf = io::Cursor::new(Vec::new());
     let zip = zip::ZipWriter::new(buf);
-    let mut zip = handles.synthesize_zip_file(dir_digest.clone(), zip).await?;
+    let mut zip = zip_store
+      .synthesize_zip_file(dir_digest.clone(), zip)
+      .await?;
     let buf = zip.finish()?;
     let mut zip = zip::ZipArchive::new(buf)?;
     zip.extract(&extract_td)?;
     /* Assert that crawling the directory after extracting the synthesized zip file produces the
      * same checksums. */
-    let extracted_snapshot = handles.expand_globs(extract_td.path(), globs).await?;
+    let extracted_snapshot = crawler.expand_globs(extract_td.path(), globs).await?;
     assert_eq!(extracted_snapshot, snapshot);
     let extracted_dir_digest: fs::DirectoryDigest = extracted_snapshot.into();
     assert_eq!(extracted_dir_digest, dir_digest);

@@ -626,7 +626,6 @@ name = "executor-resource-handles"
 version = "0.0.0"
 dependencies = [
  "async-stream",
- "async-trait",
  "bytes",
  "displaydoc",
  "fs",
