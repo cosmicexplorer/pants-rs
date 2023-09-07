@@ -11,11 +11,13 @@ homepage.workspace      = true
 repository.workspace    = true
 
 [dependencies]
+async-stream.workspace  = true
 async-trait.workspace   = true
 bytes.workspace         = true
 displaydoc.workspace    = true
 fs.workspace            = true
 futures.workspace       = true
+futures-util.workspace  = true
 hashing.workspace       = true
 parking_lot.workspace   = true
 store.workspace         = true
@@ -24,7 +26,8 @@ tempfile.workspace      = true
 thiserror.workspace     = true
 tokio.workspace         = true
 tokio-stream.workspace  = true
-zip-merge               = { version = "0.6.6", features = ["merge", "rayon", "time"] }
+# zip-merge               = { version = "0.6.6", features = ["merge", "rayon", "time"] }
+zip-merge               = { path = "/home/cosmicexplorer/tools/zip", features = ["merge", "rayon", "time"] }
 
 [dev-dependencies]
 tokio                   = { workspace = true, features = ["macros"] }
