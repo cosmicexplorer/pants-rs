@@ -610,12 +610,85 @@ pub trait DirectoryStore {
   ) -> Result<fs::DirectoryDigest, HandleError>;
 }
 
+/// Manipulate zip files as directory trees.
 #[async_trait]
 pub trait ZipFileStore {
+  /// Enter the contents of `archive` into the local store as a directory tree.
+  ///
+  ///```
+  /// # use executor_resource_handles::HandleError;
+  /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{ZipFileStore, Handles};
+  /// use tempfile::tempdir;
+  /// use zip_merge::{ZipArchive, ZipWriter, write::FileOptions};
+  /// use std::{io::{Write, Cursor}, str::FromStr};
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let buf = Cursor::new(Vec::new());
+  /// let mut zip = ZipWriter::new(buf);
+  /// let options = FileOptions::default();
+  /// zip.start_file("hello_world.txt", options)?;
+  /// zip.write(b"Hello, World!")?;
+  /// let buf = zip.finish()?;
+  ///
+  /// let zip = ZipArchive::new(buf)?;
+  /// let dir_digest = handles.store_zip_entries(zip).await?;
+  /// let digest = hashing::Digest {
+  ///   hash: hashing::Fingerprint::from_str("a44a45978694cc8277b5df3ca4de74e7a6c3a8230e714937b96f3a0bcee68308")?,
+  ///   size_bytes: 89,
+  /// };
+  /// assert_eq!(digest, dir_digest.as_digest());
+  /// # Ok(())
+  /// # })}
+  ///```
   async fn store_zip_entries<R: io::Read + io::Seek + Send>(
     &self,
     archive: zip::ZipArchive<R>,
   ) -> Result<fs::DirectoryDigest, HandleError>;
+
+  /// Extract the contents of `digest` into `archive`.
+  ///
+  ///```
+  /// # use executor_resource_handles::HandleError;
+  /// # fn main() -> Result<(), HandleError> { tokio_test::block_on(async {
+  /// use executor_resource_handles::{ZipFileStore, Handles};
+  /// use tempfile::tempdir;
+  /// use zip_merge::{ZipArchive, ZipWriter, write::FileOptions};
+  /// use std::{io::{Write, Cursor}, str::FromStr};
+  ///
+  /// let store_td = tempdir()?;
+  /// let handles = Handles::new(store_td.path())?;
+  ///
+  /// let buf = Cursor::new(Vec::new());
+  /// let mut zip = ZipWriter::new(buf);
+  /// let options = FileOptions::default();
+  /// zip.start_file("hello_world.txt", options)?;
+  /// zip.write(b"Hello, World!")?;
+  /// let buf = zip.finish()?;
+  ///
+  /// let zip = ZipArchive::new(buf)?;
+  /// let dir_digest = handles.store_zip_entries(zip).await?;
+  /// let digest = hashing::Digest {
+  ///   hash: hashing::Fingerprint::from_str("a44a45978694cc8277b5df3ca4de74e7a6c3a8230e714937b96f3a0bcee68308")?,
+  ///   size_bytes: 89,
+  /// };
+  /// assert_eq!(digest, dir_digest.as_digest());
+  ///
+  /// let buf = Cursor::new(Vec::new());
+  /// let zip = ZipWriter::new(buf);
+  /// let mut zip = handles.synthesize_zip_file(dir_digest, zip).await?;
+  /// let buf = zip.finish()?;
+  ///
+  /// let mut zip = ZipArchive::new(buf)?;
+  /// let extract_dir = tempdir()?;
+  /// zip.extract(&extract_dir)?;
+  /// let ret = std::fs::read_to_string(extract_dir.path().join("hello_world.txt"))?;
+  /// assert_eq!(ret, "Hello, World!");
+  /// # Ok(())
+  /// # })}
+  ///```
   async fn synthesize_zip_file<W: io::Write + io::Seek + Send>(
     &self,
     digest: fs::DirectoryDigest,
@@ -623,6 +696,7 @@ pub trait ZipFileStore {
   ) -> Result<zip::ZipWriter<W>, HandleError>;
 }
 
+/// Execution and storage context.
 pub struct Handles {
   executor: Executor,
   fs_store: store::Store,
@@ -831,7 +905,13 @@ impl ZipFileStore for Handles {
     digest_trie.walk(
       fs::SymlinkBehavior::Oblivious,
       &mut |path: &Path, entry: &fs::directory::Entry| {
-        entries.push((path.to_path_buf(), entry.clone()));
+        if path.as_os_str().is_empty() {
+          /* Ignore the top-level directory, as that does not have a corresponding entry in the zip
+           * file. */
+          assert!(matches![entry, fs::directory::Entry::Directory(_)]);
+        } else {
+          entries.push((path.to_path_buf(), entry.clone()));
+        }
       },
     );
 
@@ -839,6 +919,8 @@ impl ZipFileStore for Handles {
 
     for (path, entry) in entries.into_iter() {
       let path = format!("{}", path.display());
+      dbg!(&path);
+      dbg!(&entry);
       match entry {
         fs::directory::Entry::Directory(_) => {
           archive.add_directory(path, options)?;
