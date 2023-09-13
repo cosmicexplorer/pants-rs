@@ -472,9 +472,10 @@ impl<R> Reader<R> {
   }
 }
 
-unsafe impl<R> Send for Reader<R> {}
-
-unsafe impl<R> Sync for Reader<R> {}
+fn leak<'a, R>(inner: usize) -> &'a mut R {
+  let inner: Box<R> = unsafe { Box::from_raw(inner as *mut R) };
+  Box::leak(inner)
+}
 
 impl<R: io::Read> Reader<R> {
   pub async fn expand_reader(self) -> Result<tempfile::TempPath, HandleError> {
@@ -482,9 +483,9 @@ impl<R: io::Read> Reader<R> {
      * lifetime, even though R is moved and therefore shouldn't need to care? */
     Ok(
       task::spawn_blocking(move || {
-        let inner: Box<R> = unsafe { Box::from_raw(self.inner as *mut R) };
+        let inner: &mut R = leak(self.inner);
         let (mut tmp_out, out_path) = tempfile::NamedTempFile::new()?.into_parts();
-        io::copy(Box::leak(inner), &mut tmp_out)?;
+        io::copy(inner, &mut tmp_out)?;
         Ok::<_, io::Error>(out_path)
       })
       .await??,
@@ -494,10 +495,10 @@ impl<R: io::Read> Reader<R> {
 
 impl<R: tokio::io::AsyncRead + Unpin> Reader<R> {
   pub async fn expand_async_reader(self) -> Result<tempfile::TempPath, HandleError> {
-    let inner: Box<R> = unsafe { Box::from_raw(self.inner as *mut R) };
+    let inner: &mut R = leak(self.inner);
     let (tmp_out, out_path) = tempfile::NamedTempFile::new()?.into_parts();
     let mut tmp_out = tokio::fs::File::from_std(tmp_out);
-    tokio::io::copy(Box::leak(inner), &mut tmp_out).await?;
+    tokio::io::copy(inner, &mut tmp_out).await?;
     Ok(out_path)
   }
 }
@@ -1025,10 +1026,6 @@ struct ZipReader<R> {
   num_entries: usize,
   _ph: PhantomData<R>,
 }
-
-unsafe impl<R> Send for ZipReader<R> {}
-
-unsafe impl<R> Sync for ZipReader<R> {}
 
 impl<'a, R: io::Read + io::Seek + 'a> ZipReader<R> {
   fn process_zip_file(

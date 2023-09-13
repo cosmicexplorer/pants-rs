@@ -143,5 +143,5 @@ license                 = "Apache-2.0"
 
 keywords                = []
 categories              = []
-homepage                = "https://github.com/cosmicexplorer/pants-rs"
-repository              = "https://github.com/cosmicexplorer/pants-rs"
+homepage                = "https://github.com/cosmicexplorer/symbolic-fs"
+repository              = "https://github.com/cosmicexplorer/symbolic-fs"
