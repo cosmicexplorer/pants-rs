@@ -68,11 +68,13 @@ use zip::{result::ZipError, DateTime};
 
 use std::{
   collections::HashMap,
+  future,
   io::{self, Write},
   marker::PhantomData,
   marker::Unpin,
-  ops,
+  mem, ops,
   path::{Path, PathBuf},
+  pin::{self, Pin},
   sync::Arc,
 };
 
@@ -401,7 +403,7 @@ impl ByteStore {
   /// # Ok(())
   /// # })}
   ///```
-  pub async fn store_byte_stream<R: io::Read + Send>(
+  pub async fn store_byte_stream<R: io::Read + Send + Unpin>(
     &self,
     initial_lease: bool,
     src: R,
@@ -443,7 +445,7 @@ impl ByteStore {
   /// # Ok(())
   /// # })}
   ///```
-  pub async fn store_async_byte_stream<R: tokio::io::AsyncRead + Send + Unpin>(
+  pub async fn store_async_byte_stream<R: tokio::io::AsyncRead>(
     &self,
     initial_lease: bool,
     src: R,
@@ -458,55 +460,139 @@ impl ByteStore {
   }
 }
 
-struct Reader<R> {
-  inner: usize,
-  _ph: PhantomData<R>,
+struct BoxLeakChannel<I> {
+  args: usize,
+  _ph: PhantomData<I>,
 }
 
-impl<R> Reader<R> {
-  pub fn new(inner: R) -> Self {
+impl<I> BoxLeakChannel<I> {
+  pub fn new(args: I) -> Self {
     Self {
-      inner: Box::into_raw(Box::new(inner)) as usize,
+      args: Box::into_raw(Box::new(args)) as usize,
       _ph: PhantomData,
     }
   }
 }
 
-fn leak<'a, R>(inner: usize) -> &'a mut R {
-  let inner: Box<R> = unsafe { Box::from_raw(inner as *mut R) };
-  Box::leak(inner)
+impl<I> ops::Drop for BoxLeakChannel<I> {
+  fn drop(&mut self) {
+    if self.args != 0 {
+      let _: Box<I> = unsafe { Box::from_raw(self.args as *mut I) };
+    }
+  }
+}
+
+struct LeakHandle {
+  inner: usize,
+}
+
+impl LeakHandle {
+  pub fn new(inner: usize) -> Self {
+    Self { inner }
+  }
+}
+
+pub trait LeakRef<T> {
+  fn leak_ref<'a>(self) -> &'a T;
+  fn leak_mut<'a>(self) -> &'a mut T;
+}
+
+impl<T> LeakRef<T> for LeakHandle {
+  fn leak_ref<'a>(self) -> &'a T {
+    self.leak_mut::<'a>()
+  }
+
+  fn leak_mut<'a>(self) -> &'a mut T {
+    let Self { inner } = self;
+    let inner: Box<T> = unsafe { Box::from_raw(inner as *mut T) };
+    Box::leak(inner)
+  }
+}
+
+impl<I> BoxLeakChannel<I> {
+  pub async fn run_leak<O, F>(self, f: F) -> O::Output
+  where
+    O: future::Future,
+    F: FnOnce(LeakHandle) -> O,
+  {
+    let leak = LeakHandle::new(self.args);
+    f(leak).await
+  }
+
+  pub async fn run_boxed<O, F>(mut self, f: F) -> O::Output
+  where
+    O: future::Future,
+    F: FnOnce(I) -> O,
+  {
+    let args: Box<I> = unsafe { Box::from_raw(self.args as *mut I) };
+    self.args = 0;
+    f(*args).await
+  }
+
+  pub async fn run_mut<'a, O, F>(self, f: F) -> O::Output
+  where
+    O: future::Future,
+    F: FnOnce(&'a mut I) -> O,
+    I: 'a,
+  {
+    let args: Box<I> = unsafe { Box::from_raw(self.args as *mut I) };
+    let args: &'a mut I = Box::leak(args);
+    f(args).await
+  }
+
+  pub async fn run_pinned<'a, O, F>(self, f: F) -> O::Output
+  where
+    O: future::Future,
+    F: FnOnce(Pin<&'a mut I>) -> O,
+    I: 'a,
+  {
+    let args: Box<I> = unsafe { Box::from_raw(self.args as *mut I) };
+    let args: &'a mut I = Box::leak(args);
+    let args: Pin<&'a mut I> = unsafe { Pin::new_unchecked(args) };
+    f(args).await
+  }
+}
+
+struct Reader<R> {
+  inner: BoxLeakChannel<R>,
+}
+
+impl<R> Reader<R> {
+  pub fn new(inner: R) -> Self {
+    Self {
+      inner: BoxLeakChannel::new(inner),
+    }
+  }
+}
+
+impl<R: tokio::io::AsyncRead> Reader<R> {
+  pub async fn expand_async_reader(self) -> Result<tempfile::TempPath, HandleError> {
+    self
+      .inner
+      .run_pinned(|mut src: Pin<&mut R>| async move {
+        let (tmp_out, out_path) = tempfile::NamedTempFile::new()?.into_parts();
+        let mut tmp_out = tokio::fs::File::from_std(tmp_out);
+        tokio::io::copy(&mut src, &mut tmp_out).await?;
+        Ok::<_, HandleError>(out_path)
+      })
+      .await
+  }
 }
 
 impl<R: io::Read> Reader<R> {
   pub async fn expand_reader(self) -> Result<tempfile::TempPath, HandleError> {
-    /* FIXME: terrible, terrible hack to work around weird inference of R requiring 'static
-     * lifetime, even though R is moved and therefore shouldn't need to care? */
-    Ok(
-      task::spawn_blocking(move || {
-        let inner: &mut R = leak(self.inner);
-        let (mut tmp_out, out_path) = tempfile::NamedTempFile::new()?.into_parts();
-        io::copy(inner, &mut tmp_out)?;
-        Ok::<_, io::Error>(out_path)
+    self
+      .inner
+      .run_leak(|src: LeakHandle| async move {
+        task::spawn_blocking(move || {
+          let src: &mut R = src.leak_mut();
+          let (mut tmp_out, out_path) = tempfile::NamedTempFile::new()?.into_parts();
+          io::copy(src, &mut tmp_out)?;
+          Ok::<_, HandleError>(out_path)
+        })
+        .await?
       })
-      .await??,
-    )
-  }
-}
-
-impl<R: tokio::io::AsyncRead + Unpin> Reader<R> {
-  pub async fn expand_async_reader(self) -> Result<tempfile::TempPath, HandleError> {
-    let inner: &mut R = leak(self.inner);
-    let (tmp_out, out_path) = tempfile::NamedTempFile::new()?.into_parts();
-    let mut tmp_out = tokio::fs::File::from_std(tmp_out);
-    tokio::io::copy(inner, &mut tmp_out).await?;
-    Ok(out_path)
-  }
-}
-
-impl<R> ops::Drop for Reader<R> {
-  fn drop(&mut self) {
-    /* Drop the box. */
-    let _: Box<R> = unsafe { Box::from_raw(self.inner as *mut R) };
+      .await
   }
 }
 
