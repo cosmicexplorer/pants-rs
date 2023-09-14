@@ -71,10 +71,9 @@ use std::{
   future,
   io::{self, Write},
   marker::PhantomData,
-  marker::Unpin,
-  mem, ops,
+  ops,
   path::{Path, PathBuf},
-  pin::{self, Pin},
+  pin::Pin,
   sync::Arc,
 };
 
@@ -403,7 +402,7 @@ impl ByteStore {
   /// # Ok(())
   /// # })}
   ///```
-  pub async fn store_byte_stream<R: io::Read + Send + Unpin>(
+  pub async fn store_byte_stream<R: io::Read>(
     &self,
     initial_lease: bool,
     src: R,
@@ -492,17 +491,18 @@ impl LeakHandle {
   }
 }
 
-pub trait LeakRef<T> {
-  fn leak_ref<'a>(self) -> &'a T;
-  fn leak_mut<'a>(self) -> &'a mut T;
+trait LeakRef<T> {
+  unsafe fn leak_ref<'a>(self) -> &'a T
+  where
+    Self: Sized,
+  {
+    self.leak_mut::<'a>()
+  }
+  unsafe fn leak_mut<'a>(self) -> &'a mut T;
 }
 
 impl<T> LeakRef<T> for LeakHandle {
-  fn leak_ref<'a>(self) -> &'a T {
-    self.leak_mut::<'a>()
-  }
-
-  fn leak_mut<'a>(self) -> &'a mut T {
+  unsafe fn leak_mut<'a>(self) -> &'a mut T {
     let Self { inner } = self;
     let inner: Box<T> = unsafe { Box::from_raw(inner as *mut T) };
     Box::leak(inner)
@@ -519,6 +519,7 @@ impl<I> BoxLeakChannel<I> {
     f(leak).await
   }
 
+  #[allow(dead_code)]
   pub async fn run_boxed<O, F>(mut self, f: F) -> O::Output
   where
     O: future::Future,
@@ -529,6 +530,7 @@ impl<I> BoxLeakChannel<I> {
     f(*args).await
   }
 
+  #[allow(dead_code)]
   pub async fn run_mut<'a, O, F>(self, f: F) -> O::Output
   where
     O: future::Future,
@@ -585,7 +587,8 @@ impl<R: io::Read> Reader<R> {
       .inner
       .run_leak(|src: LeakHandle| async move {
         task::spawn_blocking(move || {
-          let src: &mut R = src.leak_mut();
+          /* TODO: make this panic if the wrong type is provided! */
+          let src: &mut R = unsafe { src.leak_mut() };
           let (mut tmp_out, out_path) = tempfile::NamedTempFile::new()?.into_parts();
           io::copy(src, &mut tmp_out)?;
           Ok::<_, HandleError>(out_path)
