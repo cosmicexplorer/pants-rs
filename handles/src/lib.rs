@@ -918,7 +918,7 @@ impl ZipFileStore {
   /// # Ok(())
   /// # })}
   ///```
-  pub async fn store_zip_entries<R: io::Read + io::Seek + Send>(
+  pub async fn store_zip_entries<R: io::Read + io::Seek>(
     &self,
     archive: zip::ZipArchive<R>,
   ) -> Result<fs::DirectoryDigest, HandleError> {
