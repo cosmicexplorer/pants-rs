@@ -54,22 +54,25 @@ pub use hashing;
 pub use store;
 pub use task_executor::Executor;
 
-use async_stream::try_stream;
+pub use zip;
+use zip::{result::ZipError, DateTime};
+
 pub use bytes::Bytes;
 use displaydoc::Display;
 use futures_util::pin_mut;
 use tempfile;
 use thiserror::Error;
-use tokio::{task, task::JoinError};
+use tokio::{
+  io::{self, AsyncWriteExt},
+  task,
+  task::JoinError,
+};
 pub use tokio_stream::Stream;
 use tokio_stream::StreamExt;
-pub use zip;
-use zip::{result::ZipError, DateTime};
 
 use std::{
   collections::HashMap,
   future,
-  io::{self, Write},
   marker::PhantomData,
   ops,
   path::{Path, PathBuf},
@@ -402,7 +405,7 @@ impl ByteStore {
   /// # Ok(())
   /// # })}
   ///```
-  pub async fn store_byte_stream<R: io::Read>(
+  pub async fn store_byte_stream<R: std::io::Read>(
     &self,
     initial_lease: bool,
     src: R,
@@ -444,7 +447,7 @@ impl ByteStore {
   /// # Ok(())
   /// # })}
   ///```
-  pub async fn store_async_byte_stream<R: tokio::io::AsyncRead>(
+  pub async fn store_async_byte_stream<R: io::AsyncRead>(
     &self,
     initial_lease: bool,
     src: R,
@@ -567,21 +570,21 @@ impl<R> Reader<R> {
   }
 }
 
-impl<R: tokio::io::AsyncRead> Reader<R> {
+impl<R: io::AsyncRead> Reader<R> {
   pub async fn expand_async_reader(self) -> Result<tempfile::TempPath, HandleError> {
     self
       .inner
       .run_pinned(|mut src: Pin<&mut R>| async move {
         let (tmp_out, out_path) = tempfile::NamedTempFile::new()?.into_parts();
         let mut tmp_out = tokio::fs::File::from_std(tmp_out);
-        tokio::io::copy(&mut src, &mut tmp_out).await?;
+        io::copy(&mut src, &mut tmp_out).await?;
         Ok::<_, HandleError>(out_path)
       })
       .await
   }
 }
 
-impl<R: io::Read> Reader<R> {
+impl<R: std::io::Read> Reader<R> {
   pub async fn expand_reader(self) -> Result<tempfile::TempPath, HandleError> {
     self
       .inner
@@ -590,7 +593,7 @@ impl<R: io::Read> Reader<R> {
           /* TODO: make this panic if the wrong type is provided! */
           let src: &mut R = unsafe { src.leak_mut() };
           let (mut tmp_out, out_path) = tempfile::NamedTempFile::new()?.into_parts();
-          io::copy(src, &mut tmp_out)?;
+          std::io::copy(src, &mut tmp_out)?;
           Ok::<_, HandleError>(out_path)
         })
         .await?
@@ -918,19 +921,49 @@ impl ZipFileStore {
   /// # Ok(())
   /// # })}
   ///```
-  pub async fn store_zip_entries<R: io::Read + io::Seek>(
+  pub async fn store_zip_entries<R: io::AsyncRead + io::AsyncSeek>(
     &self,
-    archive: zip::ZipArchive<R>,
+    archive: Pin<&mut zip::tokio::read::ZipArchive<R>>,
   ) -> Result<fs::DirectoryDigest, HandleError> {
     let mut path_stats: Vec<fs::PathStat> = Vec::new();
     let mut file_digests: HashMap<PathBuf, hashing::Digest> = HashMap::new();
 
-    let archive = ZipReader::new(archive);
-    let s = archive.stream_entries().await;
+    let s = archive.entries_stream();
     pin_mut!(s);
 
-    while let Some(ret) = s.next().await {
-      let (stat, tmp_path) = ret?;
+    while let Some(zf) = s.try_next().await? {
+      let path: PathBuf = zf
+        .name()
+        .map(|name| name.to_path_buf())
+        .map_err(|_| PathTransformError::MalformedZipName(zf.data().file_name.to_string()))?;
+
+      let (stat, reader): (
+        fs::PathStat,
+        Option<Reader<Pin<Box<zip::tokio::read::ZipFile<'_, _, _>>>>>,
+      ) = if zf.is_dir() {
+        let stat = fs::PathStat::Dir {
+          path: path.clone(),
+          stat: fs::Dir(path),
+        };
+        (stat, None)
+      } else {
+        let is_executable = zf.unix_mode().map(|m| (m & 0o111) != 0).unwrap_or(false);
+        let stat = fs::PathStat::File {
+          path: path.clone(),
+          stat: fs::File {
+            path,
+            is_executable,
+          },
+        };
+        (stat, Some(Reader::new(zf)))
+      };
+
+      let tmp_path = if let Some(reader) = reader {
+        Some(reader.expand_async_reader().await?)
+      } else {
+        None
+      };
+
       if let Some(tmp_path) = tmp_path {
         let digest = self
           .byte_store
@@ -995,11 +1028,11 @@ impl ZipFileStore {
   /// # Ok(())
   /// # })}
   ///```
-  pub async fn synthesize_zip_file<W: io::Write + io::Seek + Send>(
+  pub async fn synthesize_zip_file<W: io::AsyncWrite + io::AsyncSeek>(
     &self,
     digest: fs::DirectoryDigest,
-    mut archive: zip::ZipWriter<W>,
-  ) -> Result<zip::ZipWriter<W>, HandleError> {
+    mut archive: Pin<&mut zip::tokio::write::ZipWriter<W>>,
+  ) -> Result<(), HandleError> {
     let digest_trie = self.directory_store.load_digest_trie(digest).await?;
 
     let mut entries: Vec<(PathBuf, fs::directory::Entry)> = Vec::new();
@@ -1016,9 +1049,7 @@ impl ZipFileStore {
       },
     );
 
-    /* FIXME: explicitly use DateTime::zero() when https://github.com/zip-rs/zip/pull/399 is
-     * merged! */
-    let options = zip::write::FileOptions::default().last_modified_time(DateTime::default());
+    let options = zip::write::FileOptions::default().last_modified_time(DateTime::zero());
 
     for (path, entry) in entries.into_iter() {
       let path = format!("{}", path.display());
@@ -1026,21 +1057,21 @@ impl ZipFileStore {
       dbg!(&entry);
       match entry {
         fs::directory::Entry::Directory(_) => {
-          archive.add_directory(path, options)?;
+          archive.as_mut().add_directory(path, options).await?;
         },
         fs::directory::Entry::File(f) => {
-          archive.start_file(path, options)?;
+          archive.as_mut().start_file(path, options).await?;
           let bytes = self
             .byte_store
             .load_file_bytes_with(f.digest(), Bytes::copy_from_slice)
             .await?;
-          archive.write_all(&bytes)?;
+          archive.write_all(&bytes).await?;
         },
         _ => unreachable!("we chose SymlinkBehavior::Oblivious!"),
       }
     }
 
-    Ok(archive)
+    Ok(())
   }
 }
 
@@ -1110,88 +1141,11 @@ impl HasStore for Handles {
   }
 }
 
-struct ZipReader<R> {
-  inner: usize,
-  num_entries: usize,
-  _ph: PhantomData<R>,
-}
-
-impl<'a, R: io::Read + io::Seek + 'a> ZipReader<R> {
-  fn process_zip_file(
-    &self,
-    index: usize,
-  ) -> Result<(fs::PathStat, Option<Reader<zip::read::ZipFile<'a>>>), HandleError> {
-    let inner: Box<zip::ZipArchive<R>> =
-      unsafe { Box::from_raw(self.inner as *mut zip::ZipArchive<R>) };
-    let zf = Box::leak::<'a>(inner).by_index(index)?;
-
-    let path: PathBuf = if let Some(name) = zf.enclosed_name() {
-      Ok(name.to_path_buf())
-    } else {
-      Err(PathTransformError::MalformedZipName(zf.name().to_string()))
-    }?;
-
-    let ret = if zf.is_dir() {
-      let stat = fs::PathStat::Dir {
-        path: path.clone(),
-        stat: fs::Dir(path),
-      };
-      (stat, None)
-    } else {
-      let is_executable = zf.unix_mode().map(|m| (m & 0o111) != 0).unwrap_or(false);
-      let stat = fs::PathStat::File {
-        path: path.clone(),
-        stat: fs::File {
-          path,
-          is_executable,
-        },
-      };
-
-      (stat, Some(Reader::new(zf)))
-    };
-    Ok(ret)
-  }
-}
-
-impl<R> ops::Drop for ZipReader<R> {
-  fn drop(&mut self) {
-    /* Drop the box. */
-    let _: Box<zip::ZipArchive<R>> =
-      unsafe { Box::from_raw(self.inner as *mut zip::ZipArchive<R>) };
-  }
-}
-
-impl<R: io::Read + io::Seek> ZipReader<R> {
-  pub fn new(inner: zip::ZipArchive<R>) -> Self {
-    let num_entries = inner.len();
-    Self {
-      inner: Box::into_raw(Box::new(inner)) as usize,
-      num_entries,
-      _ph: PhantomData,
-    }
-  }
-
-  pub async fn stream_entries(
-    self,
-  ) -> impl Stream<Item = Result<(fs::PathStat, Option<tempfile::TempPath>), HandleError>> {
-    try_stream! {
-      for i in 0..self.num_entries {
-        let (stat, reader) = self.process_zip_file(i)?;
-        let tmp_path = if let Some(reader) = reader {
-          Some(reader.expand_reader().await?)
-        } else {
-          None
-        };
-        let ret = (stat, tmp_path);
-        yield ret;
-      }
-    }
-  }
-}
-
 #[cfg(test)]
 mod test {
   use super::*;
+
+  use tokio::fs;
 
   #[tokio::test]
   async fn zip_round_trip() -> Result<(), HandleError> {
@@ -1209,74 +1163,85 @@ mod test {
     std::fs::create_dir(td.path().join("c/e"))?;
     std::fs::write(td.path().join("c/e/f.txt"), "yeah\n")?;
 
-    let buf = io::Cursor::new(Vec::new());
-    let mut zip = zip::ZipWriter::new(buf);
-    /* FIXME: explicitly use DateTime::zero() when https://github.com/zip-rs/zip/pull/399 is
-     * merged! */
-    let options = zip::write::FileOptions::default().last_modified_time(DateTime::default());
-    zip.start_file("a.txt", options)?;
+    let options = zip::write::FileOptions::default().last_modified_time(DateTime::zero());
+
+    let buf = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::tokio::write::ZipWriter::new(Box::pin(buf));
+    let mut zp = Pin::new(&mut zip);
+    zp.as_mut().start_file("a.txt", options).await?;
     io::copy(
-      &mut std::fs::OpenOptions::new()
+      &mut fs::OpenOptions::new()
         .read(true)
-        .open(td.path().join("a.txt"))?,
-      &mut zip,
-    )?;
-    zip.start_file("b.txt", options)?;
+        .open(td.path().join("a.txt"))
+        .await?,
+      &mut zp.as_mut(),
+    )
+    .await?;
+    zp.as_mut().start_file("b.txt", options).await?;
     io::copy(
-      &mut std::fs::OpenOptions::new()
+      &mut fs::OpenOptions::new()
         .read(true)
-        .open(td.path().join("b.txt"))?,
-      &mut zip,
-    )?;
-    zip.add_directory("c", options)?;
-    zip.start_file("c/d.txt", options)?;
+        .open(td.path().join("b.txt"))
+        .await?,
+      &mut zp.as_mut(),
+    )
+    .await?;
+    zp.as_mut().add_directory("c", options).await?;
+    zp.as_mut().start_file("c/d.txt", options).await?;
     io::copy(
-      &mut std::fs::OpenOptions::new()
+      &mut fs::OpenOptions::new()
         .read(true)
-        .open(td.path().join("c/d.txt"))?,
-      &mut zip,
-    )?;
-    zip.add_directory("c/e", options)?;
-    zip.start_file("c/e/f.txt", options)?;
+        .open(td.path().join("c/d.txt"))
+        .await?,
+      &mut zp.as_mut(),
+    )
+    .await?;
+    zp.as_mut().add_directory("c/e", options).await?;
+    zp.as_mut().start_file("c/e/f.txt", options).await?;
     io::copy(
-      &mut std::fs::OpenOptions::new()
+      &mut fs::OpenOptions::new()
         .read(true)
-        .open(td.path().join("c/e/f.txt"))?,
-      &mut zip,
-    )?;
-    let buf = zip.finish()?;
-    let zip = zip::ZipArchive::new(buf)?;
-    let manual_zip_dir_digest = zip_store.store_zip_entries(zip).await?;
+        .open(td.path().join("c/e/f.txt"))
+        .await?,
+      &mut zp,
+    )
+    .await?;
+
+    let mut zip = zip.finish_into_readable().await?;
+    let manual_zip_dir_digest = zip_store.store_zip_entries(Pin::new(&mut zip)).await?;
     let manual_zip_snapshot = dir_store
       .load_snapshot(manual_zip_dir_digest.clone())
       .await?;
 
-    let globs = fs::PreparedPathGlobs::create(
+    let globs = crate::fs::PreparedPathGlobs::create(
       vec!["**/*.txt".to_string()],
-      fs::StrictGlobMatching::Ignore,
-      fs::GlobExpansionConjunction::AnyMatch,
+      crate::fs::StrictGlobMatching::Ignore,
+      crate::fs::GlobExpansionConjunction::AnyMatch,
     )?;
     /* Assert that the manually generated zip file produces the same checksums as crawling the
      * directory. */
     let snapshot = crawler.expand_globs(td.path(), globs.clone()).await?;
     assert_eq!(manual_zip_snapshot, snapshot);
-    let dir_digest: fs::DirectoryDigest = snapshot.clone().into();
+    let dir_digest: crate::fs::DirectoryDigest = snapshot.clone().into();
     assert_eq!(dir_digest, manual_zip_dir_digest);
 
     let extract_td = tempfile::tempdir()?;
-    let buf = io::Cursor::new(Vec::new());
-    let zip = zip::ZipWriter::new(buf);
-    let mut zip = zip_store
-      .synthesize_zip_file(dir_digest.clone(), zip)
+    let buf = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::tokio::write::ZipWriter::new(Box::pin(buf));
+    zip_store
+      .synthesize_zip_file(dir_digest.clone(), Pin::new(&mut zip))
       .await?;
-    let buf = zip.finish()?;
-    let mut zip = zip::ZipArchive::new(buf)?;
-    zip.extract(&extract_td)?;
+
+    let mut zip = zip.finish_into_readable().await?;
+    Pin::new(&mut zip)
+      .extract_simple(Arc::new(extract_td.path().to_path_buf()))
+      .await?;
+
     /* Assert that crawling the directory after extracting the synthesized zip file produces the
      * same checksums. */
     let extracted_snapshot = crawler.expand_globs(extract_td.path(), globs).await?;
     assert_eq!(extracted_snapshot, snapshot);
-    let extracted_dir_digest: fs::DirectoryDigest = extracted_snapshot.into();
+    let extracted_dir_digest: crate::fs::DirectoryDigest = extracted_snapshot.into();
     assert_eq!(extracted_dir_digest, dir_digest);
 
     Ok(())
